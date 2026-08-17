@@ -1,3 +1,4 @@
+// da cancellare
 // prx.c UDP port 2333 ADIF entry receiver by GM @2025 V 2.0
 #include "pfunc.c"
 #define PORT 2333
