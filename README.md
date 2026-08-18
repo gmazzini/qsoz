@@ -1642,19 +1642,6 @@ Gestisce callsign normali e slash portable/reciprocal, ignorando designatori:
 A E J P M MM AM QRP QRPP
 ```
 
-Esiste `test_wpx.c` con casi di regressione, tra cui:
-
-```text
-N8BJQ       -> N8
-N8BJQ/3     -> N3
-PA/N8BJQ    -> PA0
-OL25LP      -> OL25
-9A800VZ     -> 9A800
-IK4LZH/P    -> IK4
-EA8/IK4LZH/P -> EA8
-4U1UN       -> 4U1
-```
-
 ---
 
 ## 33. `qsoz_time`
@@ -1831,9 +1818,6 @@ CGI principale: liste, report, activity, import/export, QSO, callbook, cluster, 
 #### `pscore.c`, `pscore.h`
 Motore contest scoring 62 famiglie.
 
-#### `test_wpx.c`
-Test standalone di regressione WPX.
-
 #### `deploy_qsoz_test.sh`
 Install/remove symlink per ambiente `/home/www/log/qsoz`; richiede root.
 
@@ -1860,7 +1844,6 @@ qsoz_stats.o
 qsoz_time.o
 qsoz_util.o
 
-test_wpx
 ```
 
 Vengono rigenerati dai sorgenti/Makefile o da build manuali.
@@ -2099,8 +2082,7 @@ pscore          -> confrontare baseline score
 Test WPX disponibile:
 
 ```sh
-./test_wpx
-```
+./```
 
 Per il motore contest conservare `.score_before.txt` come baseline finché non esiste una suite automatizzata più completa.
 
@@ -2113,3 +2095,140 @@ qsoz contiene logiche costruite e verificate nel tempo, soprattutto su scoring, 
 > preservare la strategia e la semantica che funzionano; sostituire meccanismi fragili solo quando il nuovo comportamento è misurabile e verificato.
 
 Prima di rimuovere una funzione, una regola contest, un campo, una query o una scelta operativa storica, verificarne gli utilizzi e discuterne l'effetto. Ottimizzazioni interne sono desiderabili quando non cambiano il risultato osservabile.
+
+---
+
+## 47. Completion database rebuild (`a33`, `pcompletion.cgi`)
+
+Release 3.09 aggiunge una funzione amministrativa dedicata alla ricostruzione del database di completion usato da `pguess.cgi`.
+
+UI:
+
+```text
+a33 Completion
+```
+
+Il bottone compare dopo il login soltanto quando il callsign inserito nel login è `IK4LZH`. Questa è una comodità UI, non il controllo di sicurezza: `pcompletion.cgi` verifica nuovamente l'OTA lato server e rifiuta qualsiasi sessione che non appartenga a IK4LZH.
+
+L'output viene mostrato nel pannello destro `out2`, come l'aggiornamento CTY.
+
+Endpoint e sorgente unico:
+
+```text
+pcompletion.cgi
+pcompletion.c
+```
+
+Non esiste un modulo separato `qsoz_completion`: la funzione appartiene esclusivamente a questo CGI amministrativo.
+
+### Sorgenti e semantica
+
+Vengono considerati tutti i callsign di `log` di tutti gli utenti e tutti quelli di `wc`.
+
+La trasformazione riproduce la precedente procedura SQL:
+
+1. trim degli spazi iniziali/finali;
+2. uppercase ASCII;
+3. accettazione solo se l'intero callsign normalizzato è `[A-Z0-9]+`;
+4. solo dopo la validazione, conservazione dei primi 6 caratteri;
+5. deduplicazione globale tra `log` e `wc`;
+6. generazione di tutti i bigrammi consecutivi in `aux2`;
+7. generazione di tutti i trigrammi consecutivi in `aux3`;
+8. eliminazione dei grammi duplicati per lo stesso callsign.
+
+È importante che la validazione avvenga prima del taglio a 6 caratteri: un callsign contenente `/` o altri caratteri non validi resta escluso, esattamente come nella SQL originale.
+
+### Implementazione C
+
+MariaDB viene usato per streaming dei callsign, insert batch, creazione indici e swap finale. Normalizzazione, validazione, deduplica e generazione dei grammi avvengono in C.
+
+I callsign normalizzati sono conservati in una hash table open-addressing dinamica. Gli insert dei grammi vengono aggregati in query batch con buffer fino a circa 1 MiB.
+
+Le tabelle staging vengono create con `CREATE TABLE ... LIKE`, poi gli indici vengono temporaneamente rimossi durante il caricamento e ricreati soltanto a fine inserimento:
+
+```text
+PRIMARY KEY(callsign,gram)
+KEY gram(gram)
+```
+
+### Staging e swap atomico
+
+Il rebuild non esegue più `TRUNCATE` sulle tabelle di produzione attive.
+
+Flusso:
+
+```text
+log + wc
+   |
+   v
+hash callsign unica in RAM
+   |
+   v
+aux2_new / aux3_new senza indici
+   |
+   v
+insert batch bigrammi / trigrammi
+   |
+   v
+creazione PK + indice gram
+   |
+   v
+validazione COUNT(*)
+   |
+   v
+RENAME TABLE atomico
+```
+
+Lo swap finale è unico:
+
+```sql
+RENAME TABLE
+  aux2 TO aux2_old,
+  aux2_new TO aux2,
+  aux3 TO aux3_old,
+  aux3_new TO aux3;
+```
+
+Fino a quel momento `pguess.cgi` continua a utilizzare le vecchie `aux2/aux3`. Se il rebuild fallisce prima dello swap, le tabelle attive restano intatte.
+
+Dopo uno swap riuscito `aux2_old/aux3_old` vengono eliminate.
+
+### Lock amministrativo
+
+Il CGI acquisisce l'advisory lock MariaDB:
+
+```text
+qsoz_completion_rebuild
+```
+
+con timeout zero. Due rebuild non possono quindi essere eseguiti contemporaneamente.
+
+### Validazione reale del 18 agosto 2026
+
+Il nuovo algoritmo C è stato eseguito sul database reale e confrontato con query read-only equivalenti alla procedura SQL originale.
+
+Risultato C:
+
+```text
+log rows scanned:    1210077
+wc rows scanned:      243762
+valid source rows:   1427110
+unique callsigns:     239966
+aux2 bigrams:        1064138
+aux3 trigrams:        825541
+elapsed:              circa 10 secondi
+```
+
+Riferimento SQL indipendente:
+
+```text
+calls       239966
+aux2_ref   1064138
+aux3_ref    825541
+```
+
+I conteggi coincidono esattamente.
+
+### Relazione con `pguess.cgi`
+
+`pguess.cgi` non è stato modificato. Continua a usare `aux3` per i trigrammi e `aux2` per i bigrammi, seleziona fino a 400 candidati e completa l'ordinamento fuzzy con Levenshtein in C.

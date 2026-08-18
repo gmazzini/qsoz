@@ -1,4 +1,4 @@
-<!-- Gianluca Mazzini @2022- Version 3.02 -->
+<!-- Gianluca Mazzini @2022- Version 3.03 -->
 <head>
   <meta charset="UTF-8">
   <meta http-equiv="Cache-Control" content="no-store">
@@ -97,7 +97,7 @@
       <span id="o_ota"></span><br>
       <button class="btn" id="a09">Apply</button><button class="btn" id="a10">Report</button><br>
       <button class="btn" id="a11">Curio</button><button class="btn" id="a12">Activity</button><br>
-      <button class="btn" id="a32">CTY</button><br>
+      <button class="btn" id="a32">CTY</button><button class="btn" id="a33" hidden>Completion</button><br>
       <label class="myf1">MyPage </label><input class="myf2" id="mypage" maxlength="3" size="3" autocomplete="off"><br>
       <label class="myf1">Base </label><span id="base"></span><br>
       <label class="myf1">Release </label><span id="release"></span><br>
@@ -164,11 +164,12 @@ function setchecks() {
 }
  
 document.querySelectorAll("button[id]").forEach(btn => {
-  if (btn.id === "a32") {
+  if (btn.id === "a32" || btn.id === "a33") {
     btn.addEventListener("click", async () => {
       const out = document.getElementById("out2");
+      const endpoint = btn.id === "a32" ? "pcty.cgi" : "pcompletion.cgi";
       out.textContent = "Waiting";
-      const r = await fetch("pcty.cgi", {
+      const r = await fetch(endpoint, {
         method: "POST", cache: "no-store", credentials: "same-origin",
         headers: {"Content-Type": "text/plain"}, body: ota
       });
@@ -255,6 +256,7 @@ document.querySelectorAll("button[id]").forEach(btn => {
         document.getElementById("o_call").textContent = l01.value.trim().toUpperCase();
         document.getElementById("o_ota").textContent = ota;
         document.getElementById("mypage").value = mypage;
+        document.getElementById("a33").hidden = l01.value.trim().toUpperCase() !== "IK4LZH";
         for (let i = 0; i < 13; i++) v[9 + i] = +filter[i];
         setchecks();
       }
