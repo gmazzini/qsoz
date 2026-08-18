@@ -1,8 +1,9 @@
+<!-- Gianluca Mazzini @2022- Version 3.02 -->
 <head>
   <meta charset="UTF-8">
   <meta http-equiv="Cache-Control" content="no-store">
   <title>LOG by IK4LZH v2.1</title>
-  <link rel="stylesheet" href="log.css?v=118">
+  <link rel="stylesheet" href="qsoz.css?v=301">
 </head>
 <body>
 <div id="hh1">
@@ -96,6 +97,7 @@
       <span id="o_ota"></span><br>
       <button class="btn" id="a09">Apply</button><button class="btn" id="a10">Report</button><br>
       <button class="btn" id="a11">Curio</button><button class="btn" id="a12">Activity</button><br>
+      <button class="btn" id="a32">CTY</button><br>
       <label class="myf1">MyPage </label><input class="myf2" id="mypage" maxlength="3" size="3" autocomplete="off"><br>
       <label class="myf1">Base </label><span id="base"></span><br>
       <label class="myf1">Release </label><span id="release"></span><br>
@@ -106,8 +108,6 @@
   <div class="out" id="out"></div>
   <div class="out" id="out2"></div>
 </div>
-<script src="https://cdnjs.cloudflare.com/ajax/libs/crypto-js/4.1.1/crypto-js.min.js"></script>
-<script src="https://www.gstatic.com/charts/loader.js"></script>
 <script type="module">
 const l01 = document.getElementById("l01");
 const l02 = document.getElementById("l02");
@@ -164,7 +164,18 @@ function setchecks() {
 }
  
 document.querySelectorAll("button[id]").forEach(btn => {
-  if (/^a\d{2}$/.test(btn.id)) {
+  if (btn.id === "a32") {
+    btn.addEventListener("click", async () => {
+      const out = document.getElementById("out2");
+      out.textContent = "Waiting";
+      const r = await fetch("pcty.cgi", {
+        method: "POST", cache: "no-store", credentials: "same-origin",
+        headers: {"Content-Type": "text/plain"}, body: ota
+      });
+      out.innerHTML = await r.text();
+    });
+  }
+  else if (/^a\d{2}$/.test(btn.id)) {
     btn.addEventListener("click", async () => {
       const num = parseInt(btn.id.slice(1), 10);
       if (num == 1 || num == 6 || num == 28) base = 0;
@@ -177,7 +188,7 @@ document.querySelectorAll("button[id]").forEach(btn => {
           const plainStream = file.stream();
           const plainBlob = await new Response(plainStream).blob();
           const buf = await plainBlob.arrayBuffer();
-          let chunk = 0x8000, bytes = new Uint8Array([...new Uint8Array(buf), 0x20, 0x20, 0x20, 0x20]);
+          let chunk = 0x8000, bytes = new Uint8Array(buf);
           let binary = "";
           for (let i = 0; i < bytes.length; i += chunk) {
             binary += String.fromCharCode(...bytes.subarray(i, i + chunk));
@@ -203,6 +214,7 @@ document.querySelectorAll("button[id]").forEach(btn => {
         headers: {"Content-Type": "text/csv"},
         body
       });
+      let out = null;
       if (num == 5) {
         base = parseInt(await r.text(), 10) || 0;
         document.getElementById("a04").click();
@@ -210,7 +222,6 @@ document.querySelectorAll("button[id]").forEach(btn => {
       else {
         const html = await r.text();
         const outnum = +/<!--\s*(\d+)\s*-->/.exec(html)[1];
-        let out = null;
         if (outnum >= 9 && outnum <= 22) out = document.getElementById("out2");
         else out = document.getElementById("out");
         out.innerHTML = html;
@@ -233,8 +244,8 @@ document.querySelectorAll("button[id]").forEach(btn => {
     btn.addEventListener("click", async () => {
       const r = await fetch("plogin.cgi", {
         method: "POST", cache: "no-store", credentials: "same-origin",
-        headers: {"Content-Type": "text/csv"},
-        body: [l01.value.trim().toUpperCase(),CryptoJS.MD5(l02.value).toString()].join(",")
+        headers: {"Content-Type": "application/x-www-form-urlencoded"},
+        body: new URLSearchParams({call:l01.value.trim().toUpperCase(),password:l02.value})
       });
       [ota, mypage, filter] = (await r.text()).trim().split(",");
       mypage = Number(mypage);
@@ -442,62 +453,122 @@ hh1.style.display = "block";
 document.getElementById("sigtx").value = "59";
 document.getElementById("sigrx").value = "59";
 document.getElementById("base").textContent = base;
-document.getElementById("release").textContent = "xxxxxxxx";
+async function releaseupdate() {
+  const el=document.getElementById("release");
 
-google.charts.load('current',{packages:['corechart']});
+  try {
+    const r=await fetch("ptime.cgi?release",{cache:"no-store"});
+    if(!r.ok)throw new Error("release");
+    el.textContent=(await r.text()).trim();
+  }
+  catch {
+    el.textContent="?";
+  }
+}
 
-function renderCharts(root=document){
-  google.charts.setOnLoadCallback(()=> {
-    root.querySelectorAll(".gchart").forEach(el=>{
-      const rows = JSON.parse(el.dataset.rows);
-      function fmtDDHHMM(epochSec){
-        const d = new Date(epochSec * 1000);
-        const dd = String(d.getDate()).padStart(2,'0');
-        const hh = String(d.getHours()).padStart(2,'0');
-        const mm = String(d.getMinutes()).padStart(2,'0');
-        return `${dd}-${hh}:${mm}`;
-      }
-      const rowsFmt = rows.map(r => [ fmtDDHHMM(r[0]), r[1], r[2], r[3], r[4] ])
-      const d = new google.visualization.DataTable();
-      d.addColumn('string','Time');
-      d.addColumn('number','QSO');
-      d.addColumn('number','Points');
-      d.addColumn('number','Mults');
-      d.addColumn('number','Score');
-      d.addRows(rowsFmt); 
-      const o = {
-        backgroundColor: { fill: 'transparent' },
-        chartArea: { backgroundColor: { fill: 'transparent' } },
-        legend:{position:'bottom'},
-        hAxis:{ title:'Time', gridlines:{count:8} },
-        vAxes:{
-          0:{ title:'QSO/Points/Mults' },
-          1:{ title:'Score' }
-        },
-        series:{
-          0:{targetAxisIndex:0,pointsVisible:1},
-          1:{targetAxisIndex:0,pointsVisible:1},
-          2:{targetAxisIndex:0,pointsVisible:1},
-          3:{targetAxisIndex:1,pointsVisible:1}
-        }
-      };
-      const chart = new google.visualization.LineChart(el);
-      chart.draw(d,o);
-      window.addEventListener('resize', ()=>chart.draw(d,o));
-    });
+releaseupdate();
+
+const SVG_NS="http://www.w3.org/2000/svg";
+
+function svgNode(name,attrs={},text="") {
+  const el=document.createElementNS(SVG_NS,name);
+  Object.entries(attrs).forEach(([k,v])=>el.setAttribute(k,v));
+  if(text)el.textContent=text;
+  return el;
+}
+
+function chartTime(epochSec) {
+  const d=new Date(epochSec*1000);
+  const dd=String(d.getDate()).padStart(2,"0");
+  const hh=String(d.getHours()).padStart(2,"0");
+  const mm=String(d.getMinutes()).padStart(2,"0");
+  return `${dd}-${hh}:${mm}`;
+}
+
+function drawChart(el,rows) {
+  const width=Math.max(500,el.clientWidth||500);
+  const height=Math.max(300,el.clientHeight||520);
+  const left=58,right=72,top=22,bottom=52;
+  const pw=width-left-right,ph=height-top-bottom;
+  const svg=svgNode("svg",{viewBox:`0 0 ${width} ${height}`,width:"100%",height:"100%","aria-label":"Contest activity chart",role:"img"});
+  let maxLeft=1,maxScore=1;
+
+  rows.forEach(r=>{
+    maxLeft=Math.max(maxLeft,Number(r[1])||0,Number(r[2])||0,Number(r[3])||0);
+    maxScore=Math.max(maxScore,Number(r[4])||0);
+  });
+  const x=i=>left+(rows.length<=1?pw/2:(i*pw/(rows.length-1)));
+  const yLeft=v=>top+ph-(Number(v)||0)*ph/maxLeft;
+  const yScore=v=>top+ph-(Number(v)||0)*ph/maxScore;
+
+  for(let i=0;i<=5;i++){
+    const y=top+ph*i/5;
+    const lv=Math.round(maxLeft*(5-i)/5);
+    const rv=Math.round(maxScore*(5-i)/5);
+    svg.appendChild(svgNode("line",{x1:left,y1:y,x2:left+pw,y2:y,class:"chart-grid"}));
+    svg.appendChild(svgNode("text",{x:left-8,y:y+4,"text-anchor":"end",class:"chart-label"},String(lv)));
+    svg.appendChild(svgNode("text",{x:left+pw+8,y:y+4,"text-anchor":"start",class:"chart-label"},String(rv)));
+  }
+  svg.appendChild(svgNode("line",{x1:left,y1:top,x2:left,y2:top+ph,class:"chart-axis"}));
+  svg.appendChild(svgNode("line",{x1:left+pw,y1:top,x2:left+pw,y2:top+ph,class:"chart-axis"}));
+  svg.appendChild(svgNode("line",{x1:left,y1:top+ph,x2:left+pw,y2:top+ph,class:"chart-axis"}));
+
+  const ticks=Math.min(8,rows.length);
+  for(let i=0;i<ticks;i++){
+    const idx=ticks<=1?0:Math.round(i*(rows.length-1)/(ticks-1));
+    const xx=x(idx);
+    svg.appendChild(svgNode("line",{x1:xx,y1:top+ph,x2:xx,y2:top+ph+5,class:"chart-axis"}));
+    svg.appendChild(svgNode("text",{x:xx,y:top+ph+20,"text-anchor":"middle",class:"chart-label"},chartTime(rows[idx][0])));
+  }
+
+  const defs=[
+    [1,yLeft,"QSO","chart-series chart-qso"],
+    [2,yLeft,"Points","chart-series chart-points"],
+    [3,yLeft,"Mults","chart-series chart-mults"],
+    [4,yScore,"Score","chart-series chart-score"]
+  ];
+  defs.forEach(def=>{
+    const points=rows.map((r,i)=>`${x(i)},${def[1](r[def[0]])}`).join(" ");
+    if(points)svg.appendChild(svgNode("polyline",{points,class:def[3]}));
+  });
+
+  let lx=left;
+  defs.forEach(def=>{
+    svg.appendChild(svgNode("line",{x1:lx,y1:height-14,x2:lx+22,y2:height-14,class:def[3]}));
+    svg.appendChild(svgNode("text",{x:lx+28,y:height-10,class:"chart-label"},def[2]));
+    lx+=92;
+  });
+  svg.appendChild(svgNode("text",{x:14,y:top+ph/2,transform:`rotate(-90 14 ${top+ph/2})`,"text-anchor":"middle",class:"chart-label"},"QSO / Points / Mults"));
+  svg.appendChild(svgNode("text",{x:width-12,y:top+ph/2,transform:`rotate(90 ${width-12} ${top+ph/2})`,"text-anchor":"middle",class:"chart-label"},"Score"));
+  el.replaceChildren(svg);
+}
+
+function renderCharts(root=document) {
+  root.querySelectorAll(".gchart").forEach(el=>{
+    let rows;
+    try { rows=JSON.parse(el.dataset.rows); }
+    catch { el.textContent="Invalid chart data"; return; }
+    if(!Array.isArray(rows) || rows.length===0){el.textContent="No chart data"; return;}
+    const draw=()=>drawChart(el,rows);
+    draw();
+    if(!el._qsozResizeObserver){
+      el._qsozResizeObserver=new ResizeObserver(draw);
+      el._qsozResizeObserver.observe(el);
+    }
   });
 }
 
 window.openImgExact = (url) => {
   const win = window.open("", "img", "width=200,height=200,resizable=1,scrollbars=0");
   if (!win) return false;
-  win.document.open();
-  win.document.write(`<!doctype html><title>Image</title>
-    <style>html,body{margin:0;padding:0;overflow:hidden} img{display:block}</style>
-    <img id="i" src="${url}">
-  `);
-  win.document.close();
-  const im = win.document.getElementById("i");
+  win.document.title = "Image";
+  const style = win.document.createElement("style");
+  style.textContent = "html,body{margin:0;padding:0;overflow:hidden} img{display:block}";
+  const im = win.document.createElement("img");
+  im.id = "i";
+  im.src = url;
+  win.document.head.replaceChildren(style);
+  win.document.body.replaceChildren(im);
   im.onload = () => {
     const w = im.naturalWidth;
     const h = im.naturalHeight;
@@ -514,3 +585,4 @@ window.openImgExact = (url) => {
   
 </script>
 </body>
+
