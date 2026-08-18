@@ -1,82 +1,228 @@
-// pcmd.c command processor by GM @2025 V 2.0
-#include "pfunc.c"
-#include "/home/www/data/log.def"
+// Gianluca Mazzini @2022- Version 3.01
+#include <errno.h>
+#include <limits.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <time.h>
+#include <mysql/mysql.h>
+#include "qsoz_config.h"
+#include "qsoz_time.h"
 
-int main(void) {
-  int c,vv,gg;
-  char buf[1000],tok[4][100],mycall[16],*p;
-  MYSQL *con;
-  MYSQL_RES *res;
-  MYSQL_ROW row;
-  time_t epoch;
+#define INPUT_SIZE 512
+#define QUERY_SIZE 1024
+#define OTA_SIZE 32
+#define CALL_SIZE 20
+#define COMMAND_SIZE 128
 
-  for(vv=0,gg=0;;){
+static int read_request(char *buf,int cap) {
+  int c,n,overflow;
+
+  n=0;
+  overflow=0;
+  for(;;) {
     c=getchar();
     if(c==EOF)break;
-    if(c==','){tok[vv][gg]='\0'; vv++; gg=0; continue;}
-    if(vv<4)tok[vv][gg++]=(char)c;
+    if(n<cap-1)buf[n++]=(char)c;
+    else overflow=1;
   }
-  tok[vv][gg]='\0';
-  
-  con=mysql_init(NULL);
-  if(con==NULL)exit(1);
-  if(mysql_real_connect(con,dbhost,dbuser,dbpassword,dbname,0,NULL,0)==NULL)exit(1);
-  mysql_query(con,"SET time_zone='+00:00'");
-  epoch=time(NULL);
-  sprintf(buf,"select mycall from user where ota='%s' and lastota+durationota>%ld limit 1",tok[0],epoch);
-  mysql_query(con,buf); res=mysql_store_result(con); row=mysql_fetch_row(res);
-  if(row==NULL)exit(1);
-  strcpy(mycall,row[0]);
-  mysql_free_result(res);
+  buf[n]='\0';
+  return overflow?0:1;
+}
 
-  p=strtok(tok[3],"=");
-  buf[0]='\0';
-  if(strcmp(p,"DEL")==0 || strcmp(p,"DELETE")==0)
-    sprintf(buf,"delete from log where mycall='%s' and callsign='%s' and open=%lld",mycall,tok[2],atoll(tok[1]));
-  else if(strcmp(p,"FT")==0 || strcmp(p,"FREQTX")==0){
-    p=strtok(NULL,"=");
-    if(p!=NULL)sprintf(buf,"update log set freqtx=%ld where mycall='%s' and callsign='%s' and open=%lld",atol(p)*1000L,mycall,tok[2],atoll(tok[1]));
+static int split_request(char *buf,char **tok) {
+  int i;
+  char *p;
+
+  tok[0]=buf;
+  for(i=1;i<4;i++) {
+    p=strchr(tok[i-1],',');
+    if(p==NULL)return 0;
+    *p='\0';
+    tok[i]=p+1;
   }
-  else if(strcmp(p,"FR")==0 || strcmp(p,"FREQRX")==0){
-    p=strtok(NULL,"=");
-    if(p!=NULL)sprintf(buf,"update log set freqrx=%ld where mycall='%s' and callsign='%s' and open=%lld",atol(p)*1000L,mycall,tok[2],atoll(tok[1]));
+  return strchr(tok[3],',')==NULL;
+}
+
+static int parse_long(const char *s,long *value) {
+  char *end;
+  long n;
+
+  if(s==NULL || *s=='\0')return 0;
+  errno=0;
+  n=strtol(s,&end,10);
+  if(errno!=0 || end==s || *end!='\0')return 0;
+  *value=n;
+  return 1;
+}
+
+static int valid_len(const char *s,unsigned long max) {
+  unsigned long n;
+
+  n=(unsigned long)strlen(s);
+  return n>0 && n<=max;
+}
+
+static int escape_value(MYSQL *con,char *dst,unsigned long cap,const char *src) {
+  unsigned long n;
+
+  if(cap<3)return 0;
+  n=mysql_real_escape_string(con,dst,src,(unsigned long)strlen(src));
+  return n<cap;
+}
+
+static int get_mycall(MYSQL *con,const char *ota,char *mycall,unsigned long cap) {
+  MYSQL_RES *res;
+  MYSQL_ROW row;
+  char esc[OTA_SIZE*2+1],query[QUERY_SIZE];
+  time_t now;
+  int ok;
+
+  if(!escape_value(con,esc,sizeof(esc),ota))return 0;
+  now=time(NULL);
+  sprintf(query,"select mycall from user where ota='%s' and lastota+durationota>%lld limit 1",esc,(long long)now);
+  if(mysql_query(con,query)!=0)return 0;
+  res=mysql_store_result(con);
+  if(res==NULL)return 0;
+  row=mysql_fetch_row(res);
+  ok=0;
+  if(row!=NULL && row[0]!=NULL && strlen(row[0])<cap) {
+    strcpy(mycall,row[0]);
+    ok=1;
   }
-  else if(strcmp(p,"M")==0 || strcmp(p,"MODE")==0){
-    p=strtok(NULL,"=");
-    if(p!=NULL)sprintf(buf,"update log set mode='%s' where mycall='%s' and callsign='%s' and open=%lld",p,mycall,tok[2],atoll(tok[1]));
+  mysql_free_result(res);
+  return ok;
+}
+
+int main(void) {
+  QsozConfig cfg;
+  MYSQL *con;
+  char input[INPUT_SIZE],*tok[4],mycall[CALL_SIZE+1],command[COMMAND_SIZE+1];
+  char esc_mycall[CALL_SIZE*2+1],esc_call[CALL_SIZE*2+1],esc_value[COMMAND_SIZE*2+1];
+  char query[QUERY_SIZE],err[256],*eq,*key,*value,*column;
+  long open,n;
+  time_t epoch;
+  unsigned long maxlen;
+  int is_string,is_freq,is_delete;
+
+  printf("Content-Type: text/plain\r\n\r\n");
+  if(!read_request(input,sizeof(input)) || !split_request(input,tok)) {
+    fprintf(stderr,"pcmd: invalid request\n");
+    printf("ERROR\n");
+    return 0;
   }
-  else if(strcmp(p,"ST")==0 || strcmp(p,"SIGNALTX")==0){
-    p=strtok(NULL,"=");
-    if(p!=NULL)sprintf(buf,"update log set signaltx='%s' where mycall='%s' and callsign='%s' and open=%lld",p,mycall,tok[2],atoll(tok[1]));
+  if(!valid_len(tok[0],OTA_SIZE) || !parse_long(tok[1],&open) || open<0 || !valid_len(tok[2],CALL_SIZE) || !valid_len(tok[3],COMMAND_SIZE)) {
+    fprintf(stderr,"pcmd: invalid request fields\n");
+    printf("ERROR\n");
+    return 0;
   }
-  else if(strcmp(p,"SR")==0 || strcmp(p,"SIGNALRX")==0){
-    p=strtok(NULL,"=");
-    if(p!=NULL)sprintf(buf,"update log set signalrx='%s' where mycall='%s' and callsign='%s' and open=%lld",p,mycall,tok[2],atoll(tok[1]));
+  strcpy(command,tok[3]);
+  if(!qsoz_config_load(&cfg,QSOZ_CONFIG_FILE,err,sizeof(err))) {
+    fprintf(stderr,"pcmd: %s\n",err);
+    printf("ERROR\n");
+    return 1;
   }
-  else if(strcmp(p,"C")==0 || strcmp(p,"CALL")==0){
-    p=strtok(NULL,"=");
-    if(p!=NULL)sprintf(buf,"update log set callsign='%s' where mycall='%s' and callsign='%s' and open=%lld",p,mycall,tok[2],atoll(tok[1]));
+
+  con=mysql_init(NULL);
+  if(con==NULL) {
+    fprintf(stderr,"pcmd: mysql_init failed\n");
+    printf("ERROR\n");
+    return 1;
   }
-  else if(strcmp(p,"DTS")==0 || strcmp(p,"DATETIMESTART")==0){
-    p=strtok(NULL,"=");
-    if(p!=NULL)sprintf(buf,"update log set open=%lld where mycall='%s' and callsign='%s' and open=%lld",dtc2e(p),mycall,tok[2],atoll(tok[1]));
+  if(mysql_real_connect(con,cfg.db_host,cfg.db_user,cfg.db_pass,cfg.db_name,cfg.db_port,NULL,0)==NULL) {
+    fprintf(stderr,"pcmd: mysql connect: %s\n",mysql_error(con));
+    mysql_close(con);
+    printf("ERROR\n");
+    return 1;
   }
-  else if(strcmp(p,"DTE")==0 || strcmp(p,"DATETIMEEND")==0){
-    p=strtok(NULL,"=");
-    if(p!=NULL)sprintf(buf,"update log set close=%lld where mycall='%s' and callsign='%s' and open=%lld",dtc2e(p),mycall,tok[2],atoll(tok[1]));
-  }  
-  else if(strcmp(p,"CO")==0 || strcmp(p,"CONTEST")==0){
-    p=strtok(NULL,"=");
-    if(p!=NULL)sprintf(buf,"update log set contest='%s' where mycall='%s' and callsign='%s' and open=%lld",p,mycall,tok[2],atoll(tok[1]));
+  if(!get_mycall(con,tok[0],mycall,sizeof(mycall))) {
+    fprintf(stderr,"pcmd: invalid or expired session\n");
+    mysql_close(con);
+    printf("ERROR\n");
+    return 0;
   }
-  else if(strcmp(p,"COT")==0 || strcmp(p,"CONTESTTX")==0){
-    p=strtok(NULL,"=");
-    if(p!=NULL)sprintf(buf,"update log set contesttx='%s' where mycall='%s' and callsign='%s' and open=%lld",p,mycall,tok[2],atoll(tok[1]));
+  if(!escape_value(con,esc_mycall,sizeof(esc_mycall),mycall) || !escape_value(con,esc_call,sizeof(esc_call),tok[2])) {
+    mysql_close(con);
+    printf("ERROR\n");
+    return 1;
   }
-  else if(strcmp(p,"COR")==0 || strcmp(p,"CONTESTRX")==0){
-    p=strtok(NULL,"=");
-    if(p!=NULL)sprintf(buf,"update log set contestrx='%s' where mycall='%s' and callsign='%s' and open=%lld",p,mycall,tok[2],atoll(tok[1]));
+
+  eq=strchr(command,'=');
+  key=command;
+  value=NULL;
+  if(eq!=NULL) {
+    *eq='\0';
+    value=eq+1;
   }
-  if(buf[0]!='\0')mysql_query(con,buf);
+  column=NULL;
+  maxlen=0;
+  is_string=0;
+  is_freq=0;
+  is_delete=0;
+
+  if(strcmp(key,"DEL")==0 || strcmp(key,"DELETE")==0)is_delete=1;
+  else if(strcmp(key,"FT")==0 || strcmp(key,"FREQTX")==0) {column="freqtx"; is_freq=1;}
+  else if(strcmp(key,"FR")==0 || strcmp(key,"FREQRX")==0) {column="freqrx"; is_freq=1;}
+  else if(strcmp(key,"M")==0 || strcmp(key,"MODE")==0) {column="mode"; maxlen=8; is_string=1;}
+  else if(strcmp(key,"ST")==0 || strcmp(key,"SIGNALTX")==0) {column="signaltx"; maxlen=8; is_string=1;}
+  else if(strcmp(key,"SR")==0 || strcmp(key,"SIGNALRX")==0) {column="signalrx"; maxlen=8; is_string=1;}
+  else if(strcmp(key,"C")==0 || strcmp(key,"CALL")==0) {column="callsign"; maxlen=20; is_string=1;}
+  else if(strcmp(key,"DTS")==0 || strcmp(key,"DATETIMESTART")==0)column="open";
+  else if(strcmp(key,"DTE")==0 || strcmp(key,"DATETIMEEND")==0)column="close";
+  else if(strcmp(key,"CO")==0 || strcmp(key,"CONTEST")==0) {column="contest"; maxlen=20; is_string=1;}
+  else if(strcmp(key,"COT")==0 || strcmp(key,"CONTESTTX")==0) {column="contesttx"; maxlen=10; is_string=1;}
+  else if(strcmp(key,"COR")==0 || strcmp(key,"CONTESTRX")==0) {column="contestrx"; maxlen=10; is_string=1;}
+  else {
+    fprintf(stderr,"pcmd: unknown command\n");
+    mysql_close(con);
+    printf("ERROR\n");
+    return 0;
+  }
+
+  if(is_delete) {
+    if(value!=NULL) {
+      mysql_close(con);
+      printf("ERROR\n");
+      return 0;
+    }
+    sprintf(query,"delete from log where mycall='%s' and callsign='%s' and open=%ld",esc_mycall,esc_call,open);
+  } else {
+    if(value==NULL || *value=='\0') {
+      mysql_close(con);
+      printf("ERROR\n");
+      return 0;
+    }
+    if(is_string) {
+      if(!valid_len(value,maxlen) || !escape_value(con,esc_value,sizeof(esc_value),value)) {
+        mysql_close(con);
+        printf("ERROR\n");
+        return 0;
+      }
+      sprintf(query,"update log set %s='%s' where mycall='%s' and callsign='%s' and open=%ld",column,esc_value,esc_mycall,esc_call,open);
+    } else if(is_freq) {
+      if(!parse_long(value,&n) || n<0 || n>LONG_MAX/1000L) {
+        mysql_close(con);
+        printf("ERROR\n");
+        return 0;
+      }
+      sprintf(query,"update log set %s=%ld where mycall='%s' and callsign='%s' and open=%ld",column,n*1000L,esc_mycall,esc_call,open);
+    } else {
+      if(!qsoz_datetime_to_epoch(value,&epoch)) {
+        mysql_close(con);
+        printf("ERROR\n");
+        return 0;
+      }
+      sprintf(query,"update log set %s=%lld where mycall='%s' and callsign='%s' and open=%ld",column,(long long)epoch,esc_mycall,esc_call,open);
+    }
+  }
+
+  if(mysql_query(con,query)!=0) {
+    fprintf(stderr,"pcmd: mysql query: %s\n",mysql_error(con));
+    mysql_close(con);
+    printf("ERROR\n");
+    return 1;
+  }
   mysql_close(con);
+  printf("OK\n");
+  return 0;
 }
