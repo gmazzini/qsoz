@@ -4,7 +4,7 @@ Web logger radioamatoriale di Gianluca Mazzini / IK4LZH.
 
 Questo README descrive lo stato reale del progetto `qsoz` in `/home/tools/mcp/work/qsoz` al 18 agosto 2026. È pensato come documento master del progetto: architettura, flussi, protocollo tra browser e CGI, database, dipendenze, servizi esterni, contest scoring, import/export, radio control, deployment e responsabilità di ogni file presente nella directory.
 
-La release applicativa mostrata dalla UI è definita in `qsoz_version.h` ed è attualmente **3.08**. I singoli sorgenti mantengono versioni storiche proprie e non devono essere interpretati come numero globale di release.
+La release applicativa mostrata dalla UI è definita in `qsoz_version.h` ed è attualmente **3.10**. I singoli sorgenti mantengono versioni storiche proprie e non devono essere interpretati come numero globale di release.
 
 ---
 
@@ -25,7 +25,9 @@ La release applicativa mostrata dalla UI è definita in `qsoz_version.h` ed è a
 - import ADIF, formato storico LZH e Cabrillo;
 - export ADIF e Cabrillo;
 - import conferme QSL LoTW/eQSL/QRZ;
-- aggiornamento amministrativo del database CTY da BigCTY.
+- aggiornamento amministrativo del database CTY da BigCTY;
+- ricostruzione amministrativa del database di completion `aux2/aux3`;
+- analisi globale FT8/MFSK con pagina dedicata `ft8.chaos.cc` generata interamente da CGI C.
 
 L'architettura corrente mantiene CGI C piccoli e un CGI principale (`pproc.cgi`), con JavaScript vanilla sul browser e MariaDB come storage permanente.
 
@@ -1812,6 +1814,12 @@ Clock server e release endpoint.
 #### `pcty.c`
 Updater BigCTY amministrativo con swap atomico.
 
+#### `pcompletion.c`
+CGI amministrativo riservato a IK4LZH per ricostruire `aux2` e `aux3` da tutti i callsign validi presenti in `log` e `wc`. Normalizzazione, deduplica e generazione bigrammi/trigrammi sono eseguite in C; il DB usa tabelle staging e swap atomico finale.
+
+#### `pft8.c`
+CGI pubblico per `ft8.chaos.cc`. Analizza tutti i QSO FT8/MFSK, genera direttamente HTML/CSS/SVG senza librerie grafiche esterne e usa una cache binaria invalidata automaticamente quando cambiano `log` o `cty`.
+
 #### `pproc.c`
 CGI principale: liste, report, activity, import/export, QSO, callbook, cluster, contest.
 
@@ -1827,7 +1835,9 @@ Non modificare manualmente:
 
 ```text
 pcmd.cgi
+pcompletion.cgi
 pcty.cgi
+pft8.cgi
 pguess.cgi
 plogin.cgi
 pproc.cgi
@@ -1882,9 +1892,9 @@ Serve come riferimento per evitare variazioni involontarie del motore score.
 Le intestazioni dei file non sono uniformate deliberatamente a una sola release. Stato letto:
 
 ```text
-qsoz_version.h   3.08 global release
-index.html       3.02
-Makefile         3.03
+qsoz_version.h   3.10 global release
+index.html       3.03
+Makefile         3.04
 pproc.c          3.04
 pguess.c         3.01
 pcmd.c           3.01
@@ -1892,6 +1902,8 @@ plogin.c         3.03
 pradio.c         3.01
 ptime.c          3.02
 pcty.c           3.0
+pcompletion.c    3.0
+pft8.c           3.01
 pscore.c         3.02
 pscore.h         3.01
 qsoz_config.*    3.0
@@ -1953,6 +1965,8 @@ pradio.cgi
 ptime.cgi
 pproc.cgi
 pcty.cgi
+pcompletion.cgi
+pft8.cgi
 ```
 
 `pproc.cgi` è il target più dipendente e linka entrambi i layer radio condivisi.
@@ -2232,3 +2246,80 @@ I conteggi coincidono esattamente.
 ### Relazione con `pguess.cgi`
 
 `pguess.cgi` non è stato modificato. Continua a usare `aux3` per i trigrammi e `aux2` per i bigrammi, seleziona fino a 400 candidati e completa l'ordinamento fuzzy con Levenshtein in C.
+
+
+---
+
+## FT8 symmetricity CGI
+
+Il progetto contiene anche `pft8.c`, compilato come `pft8.cgi`, che sostituisce la precedente pagina PHP `ft8.chaos.cc` basata su `symmetricity.php`, `utility.php` e Google Charts.
+
+Il CGI è autonomo lato presentazione: genera direttamente HTML, CSS e SVG e non carica librerie JavaScript o grafiche esterne. Usa soltanto MariaDB e `libm` in fase di link.
+
+Analizza globalmente i QSO `mode='FT8'` o `mode='MFSK'` di tutti gli utenti. Sono inclusi nella statistica soltanto record con `signaltx`, `signalrx` e delta `signaltx-signalrx` tutti nell'intervallo `-35..+35 dB`. Il denominatore della distribuzione, media e deviazione standard usa esattamente lo stesso insieme di QSO visualizzato.
+
+Le sezioni prodotte sono:
+
+- PDF di `TX-RX` per banda 160/80/60/40/30/20/17/15/12/10 metri e totale;
+- QSO, media e deviazione standard per banda e totale;
+- andamento temporale per CQ zone, mantenendo il bucket temporale storico della precedente implementazione PHP.
+
+### Cache FT8
+
+Una scansione completa interessa oltre un milione di QSO FT8/MFSK e richiede circa 2.6 secondi sul database corrente. Per evitare di ripeterla a ogni accesso, `pft8.cgi` mantiene una cache binaria runtime:
+
+```text
+/home/www/ft8/.pft8.cache
+```
+
+La cache contiene soltanto gli aggregati già calcolati, non l'HTML. La chiave di validità comprende:
+
+```text
+UPDATE_TIME di log
+UPDATE_TIME di cty
+MAX(log.open)
+stima TABLE_ROWS di log
+```
+
+Se uno di questi valori cambia il CGI rifà l'analisi completa e sostituisce la cache atomicamente. Se non cambia, carica direttamente gli aggregati e genera gli SVG senza scandire `log`.
+
+Misure effettuate sul deployment reale il 19 agosto 2026:
+
+```text
+prima richiesta, cache assente: circa 2.66 s
+richiesta successiva, cache valida: circa 0.016 s
+cache binaria: circa 43 KB
+HTML/SVG non compresso: circa 404 KB
+risposta HTTP gzip: circa 46 KB
+```
+
+Apache ha già `mod_deflate` attivo e invia `Content-Encoding: gzip`, quindi non è necessario comprimere manualmente l'output nel CGI.
+
+### Deployment reale `ft8.chaos.cc`
+
+Il CGI è esposto tramite:
+
+```text
+/home/www/ft8/pft8.cgi -> /home/tools/mcp/work/qsoz/pft8.cgi
+```
+
+Il virtual host HTTPS è configurato con `pft8.cgi` come unico file di indice predefinito e con esecuzione CGI esplicita:
+
+```apache
+DocumentRoot /home/www/ft8
+DirectoryIndex pft8.cgi
+AddHandler cgi-script .cgi
+
+<Directory /home/www/ft8>
+  Options +ExecCGI -Indexes -MultiViews
+  Require all granted
+</Directory>
+```
+
+Il precedente handler PHP non è più necessario per la pagina di default. I vecchi symlink `symmetricity.php`, `utility.php` e `local.php` possono essere rimossi separatamente quando non servono più; `pft8.cgi` non dipende da essi.
+
+La pagina pubblica corrente è quindi:
+
+```text
+https://ft8.chaos.cc/
+```
