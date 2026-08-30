@@ -4,7 +4,7 @@ Web logger radioamatoriale di Gianluca Mazzini / IK4LZH.
 
 Questo README descrive lo stato reale del progetto `qsoz` in `/home/tools/mcp/work/qsoz` al 18 agosto 2026. È pensato come documento master del progetto: architettura, flussi, protocollo tra browser e CGI, database, dipendenze, servizi esterni, contest scoring, import/export, radio control, deployment e responsabilità di ogni file presente nella directory.
 
-La release applicativa mostrata dalla UI è definita in `qsoz_version.h` ed è attualmente **3.10**. I singoli sorgenti mantengono versioni storiche proprie e non devono essere interpretati come numero globale di release.
+La release applicativa mostrata dalla UI è definita in `qsoz_version.h` ed è attualmente **3.11**. I singoli sorgenti mantengono versioni storiche proprie e non devono essere interpretati come numero globale di release.
 
 ---
 
@@ -307,7 +307,7 @@ Gianluca Mazzini @2022- Version 3.02
 Il titolo HTML storico resta:
 
 ```text
-LOG by IK4LZH v2.1
+LOG by IK4LZH
 ```
 
 La release reale mostrata nella pagina viene invece letta dinamicamente da:
@@ -316,7 +316,7 @@ La release reale mostrata nella pagina viene invece letta dinamicamente da:
 ptime.cgi?release
 ```
 
-che restituisce `QSOZ_RELEASE`, oggi 3.08.
+che restituisce `QSOZ_RELEASE`, oggi 3.11.
 
 ### 7.1 Campi QSO
 
@@ -1767,7 +1767,7 @@ Stile globale, bottoni, layout split `out/out2`, input, chart SVG.
 Build di tutti i CGI e moduli condivisi. Usa `-O3 -std=gnu89 -Wall -Wextra`.
 
 #### `qsoz_version.h`
-Release globale mostrata all'utente. Corrente: `3.08`.
+Release globale mostrata all'utente. Corrente: `3.11`.
 
 #### `qsoz.conf`
 Configurazione privata runtime. Non è sorgente da pubblicare.
@@ -1892,8 +1892,8 @@ Serve come riferimento per evitare variazioni involontarie del motore score.
 Le intestazioni dei file non sono uniformate deliberatamente a una sola release. Stato letto:
 
 ```text
-qsoz_version.h   3.10 global release
-index.html       3.03
+qsoz_version.h   3.11 global release
+index.html       3.04
 Makefile         3.04
 pproc.c          3.04
 pguess.c         3.01
@@ -2066,7 +2066,7 @@ Questi punti non sono automaticamente “bug da correggere”; sono caratteristi
 
 1. `deploy_qsoz_test.sh` non include `pcty.cgi`, produzione sì.
 2. `pradio.c` duplica parte del networking invece di usare `qsoz_net`.
-3. `index.html` porta ancora il titolo storico `v2.1`, mentre la release dinamica è 3.08.
+3. `index.html` non contiene più una versione hardcoded nel titolo; la release globale viene letta esclusivamente da `QSOZ_RELEASE`.
 4. I numeri versione nelle intestazioni dei singoli file non coincidono con la release globale.
 5. `pguess` usa ancora candidati callsign max 6 perché `aux2/aux3` hanno `callsign varchar(6)`, mentre il logger supporta callsign fino a 20.
 6. `ConTX++` è uno stato locale browser (`v[22]`), non parte del filtro cluster 13-bit.
