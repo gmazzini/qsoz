@@ -1,1952 +1,95 @@
 # qsoz
 
-Web logger radioamatoriale di Gianluca Mazzini / IK4LZH.
+`qsoz` is a fast web-based amateur-radio logger written primarily in C.
 
-Questo README descrive lo stato reale del progetto `qsoz` in `/home/tools/mcp/work/qsoz` al 18 agosto 2026. È pensato come documento master del progetto: architettura, flussi, protocollo tra browser e CGI, database, dipendenze, servizi esterni, contest scoring, import/export, radio control, deployment e responsabilità di ogni file presente nella directory.
+The current application release is defined only by `QSOZ_RELEASE` in `qsoz_version.h` and is **3.11**. Individual source-file headers keep their own implementation revisions and are not application release numbers.
 
-La release applicativa mostrata dalla UI è definita in `qsoz_version.h` ed è attualmente **3.11**. I singoli sorgenti mantengono versioni storiche proprie e non devono essere interpretati come numero globale di release.
+The project is designed around small CGI executables, a minimal browser frontend, MariaDB storage, and shared local radio/callbook services. The main goals are low latency, predictable behavior, small dependencies, and preservation of the operating semantics accumulated in the logger over time.
 
----
+## Current layout
 
-## 1. Obiettivo del progetto
-
-`qsoz` è un logger web personale/multiutente orientato all'uso radio reale. Le funzioni principali sono:
-
-- login autenticato e sessione temporanea OTA;
-- inserimento manuale di QSO con Start/End;
-- lettura e controllo della radio;
-- elenco, ricerca e correzione dei QSO;
-- risoluzione CTY/DXCC, distanza, bearing e Maidenhead;
-- lookup callbook QRZ.com e QRZ.ru tramite servizio locale;
-- suggerimento callsign fuzzy;
-- statistiche generali, attività e curiosità;
-- DX Cluster con statistiche QSO/QSL contestuali;
-- gestione contest, score e grafico temporale;
-- import ADIF, formato storico LZH e Cabrillo;
-- export ADIF e Cabrillo;
-- import conferme QSL LoTW/eQSL/QRZ;
-- aggiornamento amministrativo del database CTY da BigCTY;
-- ricostruzione amministrativa del database di completion `aux2/aux3`;
-- analisi globale FT8/MFSK con pagina dedicata `ft8.chaos.cc` generata interamente da CGI C.
-
-L'architettura corrente mantiene CGI C piccoli e un CGI principale (`pproc.cgi`), con JavaScript vanilla sul browser e MariaDB come storage permanente.
-
----
-
-## 2. Percorsi e deployment reale
-
-Sorgente di lavoro:
+Working directory:
 
 ```text
 /home/tools/mcp/work/qsoz
 ```
 
-DocumentRoot Apache reale:
+Main production DocumentRoot:
 
 ```text
 /home/www/log
 ```
 
-Il sito di produzione usa symlink diretti dal DocumentRoot ai file di `qsoz`. Al momento risultano collegati:
+FT8 analytics DocumentRoot:
 
 ```text
-/home/www/log/index.html  -> /home/tools/mcp/work/qsoz/index.html
-/home/www/log/qsoz.css    -> /home/tools/mcp/work/qsoz/qsoz.css
-/home/www/log/pguess.cgi  -> /home/tools/mcp/work/qsoz/pguess.cgi
-/home/www/log/pproc.cgi   -> /home/tools/mcp/work/qsoz/pproc.cgi
-/home/www/log/plogin.cgi  -> /home/tools/mcp/work/qsoz/plogin.cgi
-/home/www/log/pcmd.cgi    -> /home/tools/mcp/work/qsoz/pcmd.cgi
-/home/www/log/pradio.cgi  -> /home/tools/mcp/work/qsoz/pradio.cgi
-/home/www/log/ptime.cgi   -> /home/tools/mcp/work/qsoz/ptime.cgi
-/home/www/log/pcty.cgi    -> /home/tools/mcp/work/qsoz/pcty.cgi
+/home/www/ft8
 ```
 
-Il virtual host Apache corrente contiene:
+Main production files are symbolic links to the working tree. The FT8 site uses a separate symbolic link to `pft8.cgi`.
 
-```text
-DirectoryIndex index.html
-AddHandler cgi-script .cgi
-DocumentRoot /home/www/log
-Options +ExecCGI -Indexes -MultiViews
-```
-
-`index.html` è servito come HTML statico. Non è necessario né desiderato un handler PHP per `.html`.
-
-Esiste anche `deploy_qsoz_test.sh`, che può creare un deployment di test sotto:
-
-```text
-/home/www/log/qsoz
-```
-
-Attualmente quel deployment di test non è installato.
-
-**Nota importante:** `deploy_qsoz_test.sh` non include ancora `pcty.cgi` nella propria lista di symlink, mentre il deployment di produzione lo usa. È una differenza reale dello stato corrente e non viene corretta automaticamente da questo README.
-
----
-
-## 3. Architettura complessiva
+## Architecture
 
 ```text
 Browser
   |
-  +-- index.html + qsoz.css
+  +-- index.html / qsoz.css
   |
-  +-- plogin.cgi ---------> MariaDB user
-  |       |                    |
-  |       +-- OTA 16 char -----+
-  |
-  +-- pproc.cgi ----------> MariaDB log/who/cty/aux1
-  |       |
-  |       +--> libradio_data.a
-  |       |      ADIF / CTY / locator / distance / bearing
-  |       |
-  |       +--> libradio_client.a --> callbookd :22223
-  |       |                              |
-  |       |                              +--> QRZ.com / QRZ.ru
-  |       |                              +--> aggiorna who
-  |       |
-  |       +--> qsoz_net ----------> dxcluster :22222
-  |       |
-  |       +--> pscore.o ----------> contest scoring
-  |
-  +-- pguess.cgi ---------> aux2 / aux3
-  +-- pcmd.cgi -----------> modifica log
-  +-- pradio.cgi ---------> TS-890S o rigctld
-  +-- ptime.cgi ----------> epoch / release
-  +-- pcty.cgi -----------> BigCTY -> cty atomic swap
-```
-
-I servizi radio condivisi non sono duplicati dentro qsoz. La sorgente canonica è:
-
-```text
-/home/tools/mcp/work/data
-```
-
-In particolare:
-
-```text
-libradio_data.a
-radio_data.h
-libradio_client.a
-radio_client.h
-callbookd
-dxcluster
-```
-
----
-
-## 4. Servizi esterni locali
-
-### 4.1 callbookd
-
-Servizio systemd attualmente attivo:
-
-```text
-callbookd.service
-/home/tools/mcp/work/data/callbookd
-```
-
-Default usato da qsoz:
-
-```text
-127.0.0.1:22223
-callbook_timeout=5 s
-```
-
-`qsoz` non contiene credenziali QRZ.com/QRZ.ru, sessioni HTTP o parser XML dei provider. Chiede il lookup a `callbookd` tramite:
-
-```c
-radio_callbook_lookup(host,port,source,callsign,timeout,response,cap)
-```
-
-Esiti canonici:
-
-```text
-RADIO_CALLBOOK_OK        1
-RADIO_CALLBOOK_NOTFOUND  0
-RADIO_CALLBOOK_ERROR    -1
-```
-
-`callbookd` aggiorna la tabella `who` e il CGI poi legge i dati dal DB.
-
-### 4.2 dxcluster
-
-Servizio systemd attualmente attivo:
-
-```text
-dxcluster.service
-/home/tools/mcp/work/data/dxcluster
-```
-
-Default usato da qsoz:
-
-```text
-127.0.0.1:22222
-cluster_timeout=5 s
-```
-
-`pproc.cgi` invia al servizio:
-
-```text
-<numero_spot>,<filtro>\n
-```
-
-e riceve righe:
-
-```text
-epoch,spotter,frequency,dx
-```
-
-Il CGI arricchisce poi gli spot usando CTY, storico `log` e cache `aux1`.
-
----
-
-## 5. Configurazione `qsoz.conf`
-
-File privato:
-
-```text
-/home/tools/mcp/work/qsoz/qsoz.conf
-```
-
-Permessi correnti:
-
-```text
-640 mcp:www-data
-```
-
-Nel file reale oggi sono presenti soltanto i parametri DB. Gli altri valori vengono dai default di `qsoz_config.c`.
-
-Chiavi supportate:
-
-```ini
-db_host=127.0.0.1
-db_user=...
-db_pass=...
-db_name=...
-db_port=3306
-
-callbook_host=127.0.0.1
-callbook_port=22223
-callbook_timeout=5
-
-cluster_host=127.0.0.1
-cluster_port=22222
-cluster_timeout=5
-```
-
-`qsoz_config_load()` rifiuta chiavi sconosciute e valori numerici fuori intervallo. `db_user` e `db_name` sono obbligatori; host e porte hanno default.
-
-Il file contiene segreti DB e non deve essere pubblicato, copiato nell'HTML o reso scaricabile via web.
-
----
-
-## 6. Autenticazione e sessione OTA
-
-L'autenticazione è gestita da `plogin.cgi`.
-
-### Password
-
-La tabella `user` contiene `passwd_hash`. Il backend usa libsodium:
-
-```c
-crypto_pwhash_str_verify()
-crypto_pwhash_str_needs_rehash()
-crypto_pwhash_str()
-```
-
-Se l'hash è valido ma non usa più i parametri interattivi correnti, viene rigenerato automaticamente dopo un login riuscito.
-
-La password viene azzerata dalla memoria con `sodium_memzero()` prima dell'uscita.
-
-### OTA
-
-Dopo login corretto viene generato un token casuale base62 di 16 caratteri:
-
-```text
-0-9 A-Z a-z
-```
-
-Il token viene salvato in `user.ota` insieme a `lastota`.
-
-Ogni CGI che modifica o legge dati privati verifica:
-
-```text
-user.ota = token
-AND lastota + durationota > now
-```
-
-`durationota` ha default DB 86400 secondi.
-
-Il browser conserva l'OTA soltanto nella variabile JavaScript `ota`; non viene usato un cookie applicativo qsoz.
-
-Risposta login:
-
-```text
-OTA,mypage,filter
-```
-
-Se il login fallisce:
-
-```text
-,0,
-```
-
----
-
-## 7. Frontend `index.html`
-
-`index.html` contiene tutta la UI e il JavaScript applicativo, senza framework.
-
-Header sorgente corrente:
-
-```text
-Gianluca Mazzini @2022- Version 3.02
-```
-
-Il titolo HTML storico resta:
-
-```text
-LOG by IK4LZH
-```
-
-La release reale mostrata nella pagina viene invece letta dinamicamente da:
-
-```text
-ptime.cgi?release
-```
-
-che restituisce `QSOZ_RELEASE`, oggi 3.11.
-
-### 7.1 Campi QSO
-
-Campi principali:
-
-```text
-call       callsign
-freq       frequenza visualizzata in kHz
-mode       modo
-sigtx      rapporto inviato
-sigrx      rapporto ricevuto
-contest    contest ID
-contx      exchange inviato
-conrx      exchange ricevuto
-```
-
-I campi vengono convertiti in uppercase e la virgola viene eliminata perché la virgola è delimitatore del protocollo interno CGI.
-
-### 7.2 Due aree output
-
-La pagina ha due pannelli:
-
-```text
-out   output principale a sinistra
-out2  output secondario a destra
-```
-
-Le azioni 9-22 sono normalmente inviate a `out2`; le altre a `out`.
-
-Il pulsante CTY `a32` usa esplicitamente `out2`.
-
-### 7.3 Stato locale `v[1..22]`
-
-Il browser usa un array locale di flag:
-
-```js
-let v = new Array(22+1).fill(0);
-```
-
-Significato UI:
-
-```text
-v[1]      Rig On/Off
-v[8]      Contest On/Off
-v[9]      filtro PH
-v[10]     filtro CW
-v[11]     filtro DG
-v[12]     banda 10
-v[13]     banda 15
-v[14]     banda 20
-v[15]     banda 40
-v[16]     banda 80
-v[17]     banda 160
-v[18]     banda 12
-v[19]     banda 17
-v[20]     banda 30
-v[21]     banda 60
-v[22]     ConTX++ locale
-```
-
-Al login, i 13 caratteri di `user.filter` inizializzano `v[9]..v[21]`.
-
-Per la richiesta Cluster (`a13`) il browser invia i 13 flag `v[9]..v[21]` come filtro corrente.
-
-`v[22]` non fa parte di quel filtro persistente; quando è attivo, dopo `End` incrementa localmente `contx` di 1.
-
-### 7.4 Radio memories locali
-
-Tre coppie di pulsanti memorizzano nel browser frequenza/modo:
-
-```text
-b02 / b03  slot 1
-b04 / b05  slot 2
-b06 / b07  slot 3
-```
-
-Il pulsante di richiamo aggiorna anche la radio se RigOO è attivo.
-
-### 7.5 Poll radio
-
-Se `v[1]==1`, `radioread()` interroga `pradio.cgi` ogni 10 secondi.
-
-Il backend restituisce:
-
-```text
-frequency_hz,mode
-```
-
-Il browser visualizza la frequenza come Hz / 1000 con una cifra decimale.
-
-### 7.6 Clock UTC
-
-`timeupdate()` aggiorna il display ogni secondo. Ogni 60 cicli sincronizza la differenza tra clock browser e server interrogando `ptime.cgi`.
-
-### 7.7 Grafico contest
-
-`ConGraph` riceve da `pproc.cgi` una `<div class="gchart">` con dati JSON nel `data-rows`.
-
-Il frontend disegna SVG responsive con quattro serie:
-
-```text
-QSO
-Points
-Mults
-Score
-```
-
-I campioni del backend sono finestre da 15 minuti.
-
----
-
-## 8. Protocollo browser -> `pproc.cgi`
-
-Il frontend costruisce:
-
-```js
-[
-  ota,
-  action,
-  base,
-  mypage,
-  call,
-  freq,
-  mode,
-  sigtx,
-  sigrx,
-  contest,
-  contx,
-  conrx,
-  extra,
-  data
-].join(",")
-```
-
-`qsoz_request_read()` interpreta i primi **13 campi** terminati da virgola e tutto ciò che segue come payload base64.
-
-Mappa:
-
-```text
-field 0   OTA
-field 1   action, esempio a23
-field 2   base/offset
-field 3   mypage
-field 4   call
-field 5   freq
-field 6   mode
-field 7   sigtx
-field 8   sigrx
-field 9   contest
-field 10  contest TX
-field 11  contest RX
-field 12  extra
-payload   file base64
-```
-
-`extra` viene usato principalmente per:
-
-```text
-a13 Cluster   -> filtro 13 bit
-a26 End       -> timestamp Start salvato dal browser
-```
-
-Dimensione massima payload decodificato:
-
-```text
-20,000,000 byte
-```
-
-Il decoder accetta Base64 classico e URL-safe (`+/-`, `/_`) e controlla padding, troncamenti e overflow.
-
----
-
-## 9. Mappa completa azioni UI `aXX`
-
-### Liste
-
-```text
-a01 List      reset offset e lista generale
-a02 ↑         pagina precedente lista generale
-a03 ↓         pagina successiva lista generale
-a04 R         refresh lista generale
-a05 G         calcola offset usando una data YYYYMMDD inserita in Call
-
-a06 LFind     reset ricerca callsign
-a07 ↑         pagina precedente ricerca
-a08 ↓         pagina successiva ricerca
-
-a28 LCon      reset lista contest selezionato
-a29 ↑         pagina precedente contest
-a30 ↓         pagina successiva contest
-```
-
-La ricerca `LFind` usa SQL `callsign LIKE <call>`; il valore viene escaped ma non vengono aggiunti wildcard automaticamente, quindi eventuali `%`/`_` hanno semantica SQL LIKE se presenti nell'input.
-
-### Analisi e manutenzione
-
-```text
-a09 Apply      risolve log.dxcc=0 tramite CTY
-a10 Report     statistiche banda/modo, unique, WPX, DXCC, QSL
-a11 Curio      classifiche callsign/band/mode/QSL
-a12 Activity   statistiche anno/mese/giorno
-a13 Cluster    DX Cluster arricchito
-a14 ConGraph   grafico score contest a intervalli 15 min
-a27 ConList    elenco contest presenti nel log
-a31 ConScore   score contest
-```
-
-### File e QSL
-
-```text
-a15 adi->      import ADIF
-a16 lzh->      import formato storico LZH
-a17 QSL.lotw   importa conferme LoTW da ADIF
-a18 QSL.eqsl   importa conferme eQSL da ADIF
-a19 QSL.qrz    importa conferme QRZ da ADIF
-a20 ->adi      export ADIF
-a21 ->cbr      export Cabrillo
-a22 cbr->      import Cabrillo
-```
-
-### QSO e callbook
-
-```text
-a23 Start      apre logicamente un QSO, analizza callsign e storico
-a24 QRZ.com    lookup callbook via callbookd
-a25 QRZ.ru     lookup callbook via callbookd
-a26 End        scrive il QSO nel database
-```
-
-### CTY
-
-```text
-a32 CTY        chiama pcty.cgi; solo IK4LZH può aggiornare CTY
-```
-
----
-
-## 10. Flusso Start / End di un QSO
-
-### Start (`a23`)
-
-Il browser invia callsign, frequenza, modo e rapporti correnti.
-
-Il server:
-
-1. salva nell'output il timestamp `Start: YYYY-MM-DD HH:MM:SS`;
-2. esegue `radio_cty_lookup()` del corrispondente;
-3. mostra base CTY, nome country, DXCC, continente, CQ/ITU zone, coordinate e GMT shift;
-4. risolve CTY anche per `mycall`;
-5. calcola distanza e bearing dalle coordinate CTY;
-6. se esistono locator Maidenhead in `who`, calcola anche distanza/bearing da locator;
-7. conta QSO precedenti con lo stesso DXCC;
-8. se `who` non contiene il callsign, chiede un lookup QRZ.com a `callbookd`;
-9. mostra dati callbook e immagine, se disponibili;
-10. legge tutto lo storico del callsign nel log;
-11. mostra fino agli ultimi 5 QSO;
-12. aggrega storico per banda/modo e QSL LoTW/eQSL/QRZ.
-
-Il browser estrae il testo dopo `Start:` e lo conserva nella variabile locale `start`.
-
-### End (`a26`)
-
-Il browser reinvia il timestamp `start` nel field 12.
-
-Il server:
-
-1. valida campi essenziali;
-2. converte frequenza UI kHz in Hz moltiplicando per 1000;
-3. converte `start` in epoch UTC;
-4. risolve DXCC via CTY;
-5. costruisce i valori SQL con `qsoz_db_log_values()`;
-6. inserisce in `log` con `open=start`, `close=time(NULL)`.
-
-Se ConTX++ (`v[22]`) è attivo il browser incrementa poi localmente l'exchange TX.
-
----
-
-## 11. Frequenze e modi
-
-Nel database `log.freqtx` e `log.freqrx` sono memorizzati in **Hz**.
-
-La UI usa valori in **kHz** con una cifra decimale, per esempio:
-
-```text
-14200.0
-```
-
-che diventa:
-
-```text
-14200000 Hz
-```
-
-`qsoz_band()` ricava la banda dal MHz intero e restituisce valori storici in decimi di metro:
-
-```text
-1 MHz       -> 1600
-3 MHz       -> 800
-5 MHz       -> 600
-7 MHz       -> 400
-10 MHz      -> 300
-14 MHz      -> 200
-18 MHz      -> 170
-21 MHz      -> 150
-24 MHz      -> 120
-28/29 MHz   -> 100
-50 MHz      -> 60
-144/145 MHz -> 20
-430-433 MHz -> 7
-```
-
-Nel contest scorer viene poi spesso usato `/10`, ottenendo 160, 80, 40, 20, ecc.
-
-`qsoz_mode()` normalizza:
-
-```text
-CW                                      -> CW
-FT8 RTTY MFSK FT4 PKT TOR AMTOR PSK     -> DG
-SSB USB LSB FM AM                        -> PH
-altro                                    -> ND
-```
-
----
-
-## 12. Database
-
-### 12.1 `user`
-
-```text
-mycall          varchar(20) PK
-passwd_hash     varchar(128)
-ota             varchar(16)
-lastota         bigint
-durationota     bigint default 86400
-mypage          smallint default 25
-filter          varchar(20) default 1001110000000
-radio           varchar(50)
-udef1           varchar(20)
-udef2           varchar(20)
-```
-
-Indici:
-
-```text
-PRIMARY KEY(mycall)
-KEY ota(ota,lastota)
-KEY ota_2(ota)
-```
-
-Responsabilità:
-
-- autenticazione;
-- sessione OTA;
-- paginazione predefinita;
-- filtro cluster iniziale;
-- configurazione radio per utente;
-- due comandi radio user-defined.
-
-### 12.2 `log`
-
-```text
-mycall       varchar(20)
-callsign     varchar(20)
-open         bigint epoch UTC
-close        bigint epoch UTC
-mode         varchar(8)
-freqtx       bigint Hz
-freqrx       bigint Hz
-signaltx     varchar(8)
-signalrx     varchar(8)
-contesttx    varchar(10)
-contestrx    varchar(10)
-contest      varchar(20)
-lotw         tinyint default 0
-eqsl         tinyint default 0
-qrz          tinyint default 0
-dxcc         smallint default 0
-```
-
-Primary key:
-
-```text
-(open,mycall,callsign,freqtx)
-```
-
-Indici correnti:
-
-```text
-(open,mycall)
-(dxcc,mycall)
-(mycall,callsign)
-(contest,mycall)
-(mycall)
-```
-
-È la tabella centrale del progetto.
-
-### 12.3 `who`
-
-Cache/anagrafica callbook:
-
-```text
-callsign PK
-firstname
-lastname
-addr1
-addr2
-state
-zip
-country
-grid
-email
-cqzone
-ituzone
-born
-image
-time
-src
-```
-
-Viene aggiornata principalmente da `callbookd`; qsoz la legge per Start, lookup e export Cabrillo.
-
-### 12.4 `cty`
-
-```text
-base
-name
-dxcc
-cont
-cqzone
-ituzone
-latitude
-longitude
-gmtshift
-prefix
-```
-
-Indici:
-
-```text
-KEY dxcc(dxcc)
-KEY prefix(prefix)
-```
-
-È usata da `radio_cty_lookup()` e dal contest scorer.
-
-### 12.5 `aux1`
-
-Cache cluster DXCC per utente:
-
-```text
-mycall
-dxcc
-qso
-qsl
-time
-PRIMARY KEY(dxcc,mycall)
-```
-
-`pproc` considera una riga fresca per 3600 secondi (`TIMEOUT_AUX1`).
-
-Quando manca o scade:
-
-```text
-qso = count(*) sul log per DXCC
-qsl = sum(lotw)+sum(eqsl)+sum(qrz)
-```
-
-La cache viene aggiornata con `REPLACE INTO aux1`.
-
-### 12.6 `aux2` / `aux3`
-
-Tabelle per il suggerimento callsign:
-
-```text
-aux2(callsign varchar(6), gram char(2))
-aux3(callsign varchar(6), gram char(3))
-```
-
-Entrambe hanno PK `(callsign,gram)` e indice `gram`.
-
-`pguess.cgi` usa bigrammi/trigrammi per limitare il set candidato prima di calcolare Levenshtein.
-
----
-
-## 13. `pguess.cgi`: suggerimento callsign
-
-Sorgente: `pguess.c`.
-
-Limiti correnti:
-
-```text
-input massimo       20 caratteri
-callsign candidato   6 caratteri
-candidati SQL       400
-output finale        50
-```
-
-Algoritmo:
-
-1. riceve il testo raw del campo Call;
-2. estrae trigrammi e bigrammi dell'input;
-3. interroga `aux3` e `aux2` e somma il numero di grammi comuni;
-4. prende massimo 400 candidati;
-5. calcola Levenshtein esatto in C;
-6. calcola distanza normalizzata `lev/max(len1,len2)`;
-7. ordina per:
-   - distanza normalizzata crescente;
-   - Levenshtein crescente;
-   - grammi comuni decrescente;
-   - callsign alfabetico;
-8. mostra massimo 50 pulsanti, 5 per riga.
-
-Il click chiama `cmd4()` e copia il callsign nel campo Call.
-
----
-
-## 14. `pcmd.cgi`: modifica puntuale dei QSO
-
-Riceve:
-
-```text
-OTA,open,callsign,command
-```
-
-Prima recupera `mycall` dalla sessione OTA valida.
-
-Comandi supportati:
-
-```text
-DEL / DELETE
-FT / FREQTX
-FR / FREQRX
-M / MODE
-ST / SIGNALTX
-SR / SIGNALRX
-C / CALL
-DTS / DATETIMESTART
-DTE / DATETIMEEND
-CO / CONTEST
-COT / CONTESTTX
-COR / CONTESTRX
-```
-
-La riga è identificata da:
-
-```text
-mycall + callsign + open
-```
-
-Le frequenze immesse nel comando vengono moltiplicate per 1000 prima di essere salvate.
-
-Le date devono essere nel formato gestito da `qsoz_datetime_to_epoch()`:
-
-```text
-YYYY-MM-DD HH:MM:SS
-```
-
----
-
-## 15. `pradio.cgi`: controllo radio
-
-`user.radio` definisce il backend.
-
-Formati supportati:
-
-```text
-TS890S,host,port,user,password
-RIGCTLD,host,port
-```
-
-Il CGI accetta:
-
-```text
-OTA,R,...        read
-OTA,S,freq:mode  set
-OTA,U,1          invia udef1 (TS890S)
-OTA,U,2          invia udef2 (TS890S)
-```
-
-### TS-890S
-
-Il backend usa il protocollo TCP Kenwood e autentica la connessione:
-
-```text
-##CN;
-##ID0...;
-```
-
-Lettura:
-
-```text
-FA;   frequenza
-OM0;  modo
-```
-
-Scrittura:
-
-```text
-FA%011ld;
-OM0x;
-```
-
-La tabella `modets890s[]` mappa i 16 codici a LSB/USB/CW/FM/AM/FSK/CW-R/FSK-R/PSK/... .
-
-### rigctld
-
-Lettura attuale:
-
-```text
-sfim\n
-```
-
-Il codice interpreta le righe di risposta e ricava frequenza e modo.
-
-Scrittura:
-
-```text
-F <Hz>\n
-M <mode> 0\n
-```
-
-### Nota architetturale
-
-`pradio.c` contiene ancora proprie routine TCP (`connect_tcp`, `send_all`) invece di riusare `qsoz_net.c`. È lo stato corrente, non un errore documentale.
-
----
-
-## 16. `ptime.cgi`
-
-Senza query restituisce:
-
-```text
-Unix epoch corrente
-```
-
-Con:
-
-```text
-?release
-```
-
-restituisce:
-
-```text
-QSOZ_RELEASE
-```
-
-Il file non usa MariaDB.
-
----
-
-## 17. CTY updater `pcty.cgi`
-
-Il pulsante CTY è una funzione amministrativa riservata a **IK4LZH**.
-
-Il CGI:
-
-1. riceve OTA;
-2. valida sintassi token;
-3. apre il DB;
-4. verifica che la sessione corrisponda a IK4LZH;
-5. scarica:
-
-```text
-https://www.country-files.com/bigcty/download/bigcty.zip
-```
-
-6. verifica HTTP/TLS e firma ZIP `PK`;
-7. legge `cty.csv` e `README.TXT` direttamente dalla memoria;
-8. crea `cty_new`;
-9. importa tutte le righe con prepared statement;
-10. richiede almeno 20.000 prefix come controllo di integrità;
-11. esegue swap atomico:
-
-```sql
-RENAME TABLE cty TO cty_old, cty_new TO cty;
-```
-
-12. elimina `cty_old`.
-
-Limiti:
-
-```text
-ZIP download max  8 MiB
-cty.csv max       16 MiB
-linea CSV max     131072 byte
-```
-
-Override BigCTY gestiti nel prefix:
-
-```text
-{continent}
-(CQ zone)
-[ITU zone]
-<latitude/longitude>
-~GMT shift~
-=exact-call prefix
-```
-
-In caso di errore di import viene eliminata `cty_new`; la tabella `cty` attiva non viene sostituita prima che l'import sia valido.
-
----
-
-## 18. Libreria radio condivisa `work/data`
-
-`qsoz` linka:
-
-```text
-/home/tools/mcp/work/data/libradio_data.a
-/home/tools/mcp/work/data/libradio_client.a
-```
-
-### `radio_data.h`
-
-API usate:
-
-```c
-radio_adif_extract()
-radio_cty_lookup()
-radio_adif_time()
-radio_locator_to_latlon()
-radio_distance_km()
-radio_bearing_deg()
-radio_locator_distance_bearing()
-```
-
-Il layer è la sorgente canonica per:
-
-- parsing ADIF;
-- lookup CTY/DXCC;
-- conversione date ADIF UTC;
-- locator Maidenhead 2/4/6 caratteri;
-- distanza great-circle con raggio terrestre 6371 km;
-- initial bearing normalizzato 0..360.
-
-Non duplicare queste funzioni in qsoz.
-
-### `radio_client.h`
-
-Fornisce il client per `callbookd`. Le credenziali remote devono restare in `work/data/radio.conf`, non in `qsoz.conf`.
-
----
-
-## 19. Import ADIF (`a15`)
-
-Campi letti:
-
-```text
-call
-freq
-freq_rx
-rst_sent
-rst_rcvd
-mode
-time_on
-time_off
-stx_string
-stx
-srx_string
-srx
-contest_id
-qso_date
-qso_date_off
-```
-
-Comportamento:
-
-- se `TIME_ON` o `TIME_OFF` hanno solo HHMM, aggiunge secondi `00`;
-- se manca `QSO_DATE_OFF`, usa `QSO_DATE`;
-- se manca `TIME_OFF`, usa `TIME_ON`;
-- risolve DXCC con CTY;
-- converte MHz ADIF in Hz moltiplicando per 1.000.000;
-- preferisce `STX_STRING` a `STX` e `SRX_STRING` a `SRX`;
-- usa `INSERT IGNORE` sul log;
-- riporta QSO processati e nuovi QSO inseriti.
-
----
-
-## 20. Import storico LZH (`a16`)
-
-Formato riconosciuto per sezioni:
-
-```text
-D<date>
-F<frequency>
-M<mode>
-<time> <callsign> [sigtx] [sigrx]
-```
-
-Se i rapporti mancano, default:
-
-```text
-59 / 59
-```
-
-La frequenza di sezione viene moltiplicata per 1000 e usata sia come TX sia come RX.
-
-Open e close coincidono con il timestamp del record importato.
-
----
-
-## 21. Import Cabrillo (`a22`)
-
-Il parser legge `CONTEST:` una volta e poi le righe `QSO:`.
-
-Campi principali:
-
-```text
-frequency
-mode
-date
-time
-sigtx
-contesttx
-callsign
-sigrx
-contestrx
-```
-
-Prima di inserire cerca un possibile QSO già esistente con:
-
-```text
-stesso callsign
-±180 secondi
-frequenza entro ±1.7 MHz
-```
-
-Se trova un QSO esistente aggiorna soltanto:
-
-```text
-contesttx
-contestrx
-contest
-```
-
-Se non lo trova crea il QSO.
-
----
-
-## 22. Import QSL (`a17`, `a18`, `a19`)
-
-Campi ADIF comuni:
-
-```text
-CALL
-TIME_ON
-QSO_DATE
-```
-
-Campo conferma per servizio:
-
-```text
-LoTW  APP_LoTW_RXQSL
-eQSL  EQSL_QSLRDATE
-QRZ   app_qrzlog_status
-```
-
-La conferma viene associata a un QSO con stesso callsign entro:
-
-```text
-±240 secondi
-```
-
-Colonne aggiornate:
-
-```text
-log.lotw
-log.eqsl
-log.qrz
-```
-
-L'output distingue:
-
-```text
-QSL processed
-new QSL inserted
-QSO missed
-```
-
----
-
-## 23. Export ADIF (`a20`)
-
-Il payload contiene un record ADIF di controllo con:
-
-```text
-export_from
-export_to
-export_contest
-```
-
-Si può esportare:
-
-- un intervallo temporale;
-- oppure tutti i QSO di un contest.
-
-Il file viene creato in:
-
-```text
-/home/www/log/files/<random>.adi
-```
-
-Campi emessi:
-
-```text
-CALL
-QSO_DATE
-TIME_ON
-QSO_DATE_OFF
-TIME_OFF
-FREQ
-FREQ_RX
-MODE
-RST_SENT
-RST_RCVD
-STX_STRING
-SRX_STRING
-CONTEST_ID
-```
-
-Header storico:
-
-```text
-<LZHlogger:9>PROGRAMID
-<EOH>
-```
-
----
-
-## 24. Export Cabrillo (`a21`)
-
-Crea:
-
-```text
-/home/www/log/files/<random>.cbr
-```
-
-Header base attuale:
-
-```text
-START-OF-LOG: 3.0
-CREATED-BY: IK4LZH logger
-CONTEST: xxxxxx
-CALLSIGN: <mycall>
-OPERATORS: <mycall>
-CATEGORY-OPERATOR: SINGLE-OP
-CATEGORY-ASSISTED: ASSISTED
-CATEGORY-BAND: ALL
-CATEGORY-POWER: LOW
-CATEGORY-TRANSMITTER: ONE
-```
-
-Nome, indirizzo ed email sono letti da `who` per `mycall`.
-
-Club fisso:
-
-```text
-Italian Contest Club
-```
-
-Le righe QSO usano frequenza kHz, modo normalizzato `PH/CW/DG`, timestamp UTC ed exchange TX/RX.
-
-Il file termina con:
-
-```text
-END-OF-LOG:
-```
-
----
-
-## 25. Report (`a10`)
-
-Analizza tutto il log fino a 433 MHz.
-
-Prima sezione, per banda/modo:
-
-```text
-QSO
-QSO uniq per callsign
-QSO WPX uniq
-QSL LoTW
-eQSL
-QRZ
-```
-
-Seconda sezione, per DXCC:
-
-```text
-QSO
-callsign unici
-WPX unici
-QSL LoTW/eQSL/QRZ
-country name da cty
-```
-
-L'aggregazione usa `qsoz_stats` in memoria.
-
----
-
-## 26. Curio (`a11`)
-
-Genera sei classifiche ordinate per frequenza:
-
-```text
-call
-band
-mode
-lotw
-eqsl
-qrz
-```
-
-Mostra massimo `mypage` elementi per colonna.
-
----
-
-## 27. Activity (`a12`)
-
-Aggrega il log in tre granularità:
-
-```text
-anno       YYYY
-mese       YYYY-MM, ultimi ~2 anni
-giorno     YYYY-MM-DD, ultimo ~mese
-```
-
-Metriche:
-
-```text
-QSO
-CW
-DG
-PH
-callsign unici
-WPX unici
-DXCC unici
-LoTW
-eQSL
-QRZ
-```
-
----
-
-## 28. DX Cluster (`a13`)
-
-`mypage` determina il numero richiesto di spot, limitato a:
-
-```text
-1..1000
-```
-
-Per ogni spot vengono calcolati:
-
-```text
-timestamp
-callsign DX
-frequenza
-QSO totali con quel DXCC
-QSL totali con quel DXCC
-QSO totali con quel callsign
-QSL totali con quel callsign
-tempo dall'ultimo QSO con quel callsign
-spotter
-```
-
-### Cache DXCC
-
-La cache `aux1` dura 3600 secondi.
-
-Le statistiche callsign invece vengono calcolate direttamente da `log` con una query batch `IN (...)`.
-
-Il pulsante a fianco dello spot richiama `cmd3()`:
-
-- copia il callsign nel campo Call;
-- copia la frequenza;
-- se la radio è attiva invia la frequenza alla radio.
-
----
-
-## 29. Contest list (`a27`)
-
-Query:
-
-```text
-contest, min(open), max(open), count(callsign)
-```
-
-per ogni contest non vuoto dell'utente.
-
-Se `conscore_supported()` riconosce il prefix del contest, la riga viene marcata `Scorable`.
-
-Il click sul nome imposta il campo Contest.
-
----
-
-## 30. Contest scoring: architettura
-
-Implementazione: `pscore.c` / `pscore.h`.
-
-Il contest ID viene riconosciuto per **prefix match**, non per uguaglianza esatta.
-
-Esempio:
-
-```text
-CQWWSSB24
-```
-
-viene riconosciuto dal tipo:
-
-```text
-CQWWSSB
-```
-
-Questo permette di conservare anno/variante nel campo `log.contest` pur riusando la stessa regola.
-
-`conscore_setup()`:
-
-1. identifica `contype`;
-2. resetta le statistiche;
-3. risolve il DXCC di `mycall`;
-4. carica da `cty` per ogni DXCC:
-   - continente;
-   - CQ zone;
-   - ITU zone.
-
-`conscore()` legge:
-
-```text
-callsign
-freqtx
-dxcc
-contesttx
-contestrx
-mode
-open
-```
-
-nel periodo richiesto.
-
-### Struttura statistica usata dallo scorer
-
-Convenzione principale di `data3[0][bucket]`:
-
-```text
-bucket 0  chiavi QSO / conteggio QSO validi
-bucket 1  punti QSO
-bucket 2  moltiplicatori per banda/gruppo
-bucket 3  moltiplicatori globali usati nel totale
-bucket 4  etichette/gruppi di output per banda/modo
-bucket 5  scratch/helper per alcune regole
-```
-
-`incdata3(...,ss,dd)` permette di rappresentare un elemento unico: alla prima apparizione assegna `ss`; sui duplicati aggiunge `dd`. Molte regole contest usano `dd=0`, quindi un duplicato della stessa chiave non incrementa QSO/punti/multiplier.
-
-`ConScore` calcola il totale corrente come:
-
-```text
-score = somma punti bucket 1 * numero moltiplicatori bucket 3
-```
-
-Per RAC, se i moltiplicatori risultano zero viene forzato 1 come comportamento esistente.
-
-`ConGraph` richiama lo stesso scorer su finestre da 900 secondi e invia al browser:
-
-```text
-epoch, qso, points, multipliers, score
-```
-
-### Contest supportati
-
-Sono attualmente 62:
-
-```text
-CQWWSSB
-CQWWCW
-CQWPXSSB
-CQWPXCW
-CQWWDIGI
-4080
-IARUHF
-CQ160SSB
-CQ160CW
-SPDX
-LZDX
-OKOMSSB
-OKOMCW
-HADX
-ARIDX
-KOSSSB
-KOSCW
-RDAC
-ARRLSSB
-ARRLCW
-RDXC
-JIDXSSB
-JIDXCW
-YODX
-CQM
-WAESSB
-WAECW
-WAERTTY
-CQ28
-UBASSB
-UBACW
-IOTA
-EUHF
-ARISEZ
-EURASIA
-WAG
-CQWPXRTTY
-SACSSB
-SACCW
-PACC
-AASSB
-AACW
-HOLYLANDDX
-EUDX
-UNDX
-URDXC
-CQBB
-BSC
-RRTC
-UCC
-PADANG
-ARRL10
-ARRLRU
-ARRLRTTY
-FTROUNDUP
-RCC
-ARKTIKA
-9ADX
-EIUKDXSSB
-EIUKDXCW
-RAC
-ARRLFIELDDAY
-```
-
-Le regole sono codificate esplicitamente in `switch(contype)` e usano, a seconda del contest:
-
-- DXCC;
-- continente;
-- CQ zone;
-- ITU zone;
-- banda;
-- modo;
-- exchange ricevuto;
-- prefix WPX;
-- area derivata dal callsign;
-- locator/distanza;
-- ora UTC;
-- callsign speciali.
-
-Commenti/limitazioni esplicite presenti nel sorgente:
-
-```text
-WAE SSB/CW/RTTY: no QTC
-IOTA: no island handling completo
-PACC: logica aree custom
-ARRL Field Day: nessuna dichiarazione power, solo QSO points
-```
-
-Queste sono regole del codice storico del progetto; questo README non le sostituisce con regolamenti esterni più recenti.
-
-### UBA
-
-`pscore.c` contiene helper dedicati:
-
-```text
-uba_eu_dxcc()
-uba_prefix()
-uba_section()
-```
-
-Per UBA SSB/CW gestisce inoltre un bonus finale basato sul numero/proporzione di QSO belgi.
-
----
-
-## 31. `qsoz_stats`: aggregatore in memoria
-
-`qsoz_stats.c` implementa un sistema a:
-
-```text
-5 channels
-400 buckets per channel
-max 200000 item per bucket
-label max 31 caratteri + NUL
-```
-
-Ogni bucket mantiene:
-
-- array dinamico `Data3`;
-- capacità;
-- hash table open-addressing FNV-1a per lookup O(1) medio.
-
-Le strutture vengono allocate con `qsoz_stats_init()`, riusate/reset con `qsoz_stats_reset()` e liberate con `qsoz_stats_free()`.
-
-`qsoz_stats_sort_bucket()` ordina per label e ricostruisce l'hash per mantenere lookup corretti dopo il sort.
-
-`cmp3()` ordina per `num` decrescente ed è usato nelle classifiche.
-
----
-
-## 32. `qsoz_util`
-
-Funzioni:
-
-```text
-qsoz_band()         MHz -> codice banda
-qsoz_mode()         modo raw -> CW/DG/PH/ND
-qsoz_wpx()          prefix WPX
-qsoz_pacc_area()    area speciale per PACC
-qsoz_min_long()
-qsoz_elapsed()      secondi -> m/h/D/M/Y
-qsoz_nfields()      conta token whitespace
-qsoz_token_valid()  token OTA base62 lungo 16
-qsoz_copy()         copia bounded
-```
-
-### WPX
-
-Gestisce callsign normali e slash portable/reciprocal, ignorando designatori:
-
-```text
-A E J P M MM AM QRP QRPP
-```
-
----
-
-## 33. `qsoz_time`
-
-Tutto il progetto usa epoch e UTC.
-
-API:
-
-```text
-qsoz_datetime_to_epoch()
-qsoz_epoch_to_datetime()
-qsoz_datetime_epoch()
-qsoz_date_clock_epoch()
-qsoz_epoch_text()
-```
-
-Formati accettati:
-
-```text
-YYYY-MM-DD HH:MM:SS
-YYYY-MM-DD + HH:MM[:SS]
-YYYYMMDD + HHMM[SS]
-```
-
-La validazione ricostruisce la data via `timegm()` e controlla che non sia stata normalizzata a una data diversa.
-
----
-
-## 34. `qsoz_html`
-
-Tre encoder distinti evitano di mescolare contesti:
-
-```text
-qsoz_html_text()        testo HTML
-qsoz_html_attr()        attributo HTML quoted
-qsoz_html_js_sq_attr()  stringa JS single-quoted dentro attributo HTML
-```
-
-Sono usati per callsign, dati callbook, URL immagine e callback inline.
-
----
-
-## 35. `qsoz_db`
-
-`qsoz_db_escape()` è il wrapper bounded per `mysql_real_escape_string()`.
-
-`qsoz_db_log_values()` costruisce la tupla SQL comune per inserire un QSO:
-
-```text
-mycall
-callsign
-mode
-freqtx
-freqrx
-signaltx
-signalrx
-contesttx
-contestrx
-contest
-dxcc
-open
-close
-```
-
-È riusata da Start/End e dagli importer per evitare duplicazioni di escaping e formato.
-
----
-
-## 36. `qsoz_net`
-
-Utility TCP condivise:
-
-```text
-qsoz_tcp_connect()
-qsoz_send_all()
-qsoz_line_reader_init()
-qsoz_read_line()
-```
-
-Caratteristiche:
-
-- IPv4/IPv6 via `getaddrinfo()`;
-- connect non-blocking con `select()` e timeout;
-- ripristino socket blocking dopo connessione;
-- timeout RX/TX;
-- gestione send parziali;
-- `MSG_NOSIGNAL`;
-- parser line-oriented con buffer residuo.
-
-È usato da `pproc.cgi` per il servizio DX Cluster.
-
----
-
-## 37. `qsoz_request`
-
-Implementa il parser del protocollo POST custom di `pproc.cgi`.
-
-Costanti:
-
-```text
-13 campi
-100 byte per campo
-payload max 20 MB
-```
-
-Il payload base64 viene allocato dinamicamente partendo da 4096 byte e crescendo fino al limite.
-
----
-
-## 38. File-by-file inventory
-
-### File sorgente / configurazione
-
-#### `index.html`
-UI completa, JavaScript, protocollo CGI, grafico SVG, controllo radio, import/export frontend.
-
-#### `qsoz.css`
-Stile globale, bottoni, layout split `out/out2`, input, chart SVG.
-
-#### `Makefile`
-Build di tutti i CGI e moduli condivisi. Usa `-O3 -std=gnu89 -Wall -Wextra`.
-
-#### `qsoz_version.h`
-Release globale mostrata all'utente. Corrente: `3.11`.
-
-#### `qsoz.conf`
-Configurazione privata runtime. Non è sorgente da pubblicare.
-
-#### `qsoz_config.c`, `qsoz_config.h`
-Parser config DB/callbook/cluster.
-
-#### `qsoz_db.c`, `qsoz_db.h`
-Escaping DB e builder comune QSO.
-
-#### `qsoz_html.c`, `qsoz_html.h`
-Escaping per HTML/attributi/JS inline.
-
-#### `qsoz_net.c`, `qsoz_net.h`
-TCP con timeout e line reader.
-
-#### `qsoz_request.c`, `qsoz_request.h`
-Parser 13 campi + payload Base64.
-
-#### `qsoz_stats.c`, `qsoz_stats.h`
-Aggregazione hash dinamica usata da report e scoring.
-
-#### `qsoz_time.c`, `qsoz_time.h`
-Conversioni data/epoch UTC.
-
-#### `qsoz_util.c`, `qsoz_util.h`
-Bande, modi, WPX, PACC, OTA validation e helper generali.
-
-#### `pguess.c`
-Fuzzy callsign suggestion.
-
-#### `pcmd.c`
-Editor/delete puntuale di QSO esistenti.
-
-#### `plogin.c`
-Login libsodium, password rehash e OTA.
-
-#### `pradio.c`
-Radio control TS-890S / rigctld.
-
-#### `ptime.c`
-Clock server e release endpoint.
-
-#### `pcty.c`
-Updater BigCTY amministrativo con swap atomico.
-
-#### `pcompletion.c`
-CGI amministrativo riservato a IK4LZH per ricostruire `aux2` e `aux3` da tutti i callsign validi presenti in `log` e `wc`. Normalizzazione, deduplica e generazione bigrammi/trigrammi sono eseguite in C; il DB usa tabelle staging e swap atomico finale.
-
-#### `pft8.c`
-CGI pubblico per `ft8.chaos.cc`. Analizza tutti i QSO FT8/MFSK, genera direttamente HTML/CSS/SVG senza librerie grafiche esterne e usa una cache binaria invalidata automaticamente quando cambiano `log` o `cty`.
-
-#### `pproc.c`
-CGI principale: liste, report, activity, import/export, QSO, callbook, cluster, contest.
-
-#### `pscore.c`, `pscore.h`
-Motore contest scoring 62 famiglie.
-
-#### `deploy_qsoz_test.sh`
-Install/remove symlink per ambiente `/home/www/log/qsoz`; richiede root.
-
-### Artefatti di build
-
-Non modificare manualmente:
-
-```text
-pcmd.cgi
-pcompletion.cgi
-pcty.cgi
-pft8.cgi
-pguess.cgi
-plogin.cgi
-pproc.cgi
-pradio.cgi
-ptime.cgi
-
-pscore.o
-qsoz_config.o
-qsoz_db.o
-qsoz_html.o
-qsoz_net.o
-qsoz_request.o
-qsoz_stats.o
-qsoz_time.o
-qsoz_util.o
-
-```
-
-Vengono rigenerati dai sorgenti/Makefile o da build manuali.
-
-### File diagnostici/storici
-
-#### `build_auth.log`
-Log di una build con warning hardening aggiuntivi e link storico `-lcrypto` su `plogin`.
-
-#### `build_auth2.log`
-Secondo log equivalente di validazione auth/build.
-
-#### `.build_no_md5.log`
-Log della build successiva senza dipendenza MD5/OpenSSL nel login; libsodium resta il meccanismo password.
-
-Questi file descrivono build passate; **non** sostituiscono il Makefile corrente.
-
-#### `.score_before.txt`
-Baseline/regressione score storica per contest selezionati, per esempio:
-
-```text
-9ADX23       9768
-AASSB21      5133
-CQWPXSSB24   3925188
-CQWWDIGI24   15717
-RAC24        3330
-...
-```
-
-Serve come riferimento per evitare variazioni involontarie del motore score.
-
----
-
-## 39. Versioni correnti dei sorgenti
-
-Le intestazioni dei file non sono uniformate deliberatamente a una sola release. Stato letto:
-
-```text
-qsoz_version.h   3.11 global release
-index.html       3.04
-Makefile         3.04
-pproc.c          3.04
-pguess.c         3.01
-pcmd.c           3.01
-plogin.c         3.03
-pradio.c         3.01
-ptime.c          3.02
-pcty.c           3.0
-pcompletion.c    3.0
-pft8.c           3.01
-pscore.c         3.02
-pscore.h         3.01
-qsoz_config.*    3.0
-qsoz_db.*        3.01
-qsoz_html.*      3.0
-qsoz_net.*       3.0
-qsoz_request.*   3.0
-qsoz_stats.*     3.02
-qsoz_time.*      3.01
-qsoz_util.*      3.02
-```
-
-`qsoz_version.h` è l'unico numero da usare come release globale della UI.
-
----
-
-## 40. Build
-
-Build completa:
+  +-- plogin.cgi -------- authentication and OTA session
+  +-- ptime.cgi --------- server time and global release
+  +-- pguess.cgi -------- callsign completion
+  +-- pradio.cgi -------- radio polling/control
+  +-- pcmd.cgi ---------- direct QSO edit/delete
+  +-- pproc.cgi --------- main QSO/report/import/export/contest CGI
+  +-- pcty.cgi ---------- CTY database maintenance, IK4LZH only
+  +-- pcompletion.cgi --- completion database rebuild, IK4LZH only
+
+MariaDB
+  +-- user
+  +-- log
+  +-- who
+  +-- cty
+  +-- aux1
+  +-- aux2 / aux3
+  +-- other operational tables used by reports, imports and qrzweb
+
+Shared local services
+  +-- callbook service
+  +-- DX Cluster service
+  +-- radio client/data libraries under /home/tools/mcp/work/data
+
+Separate FT8 site
+  +-- pft8.cgi ---------- server-side FT8/MFSK analysis and SVG rendering
+```
+
+`pproc.cgi` remains the main application endpoint. Administrative operations that are logically independent and potentially expensive are intentionally kept in separate CGI programs.
+
+## Build
+
+Build everything with:
 
 ```sh
 cd /home/tools/mcp/work/qsoz
 make
 ```
 
-Pulizia:
+Clean generated objects and CGI executables with:
 
 ```sh
 make clean
 ```
 
-`make clean` elimina:
+The build uses:
 
 ```text
-*.o
-*.cgi
+-O3 -std=gnu89 -Wall -Wextra
 ```
 
-Dipendenze di compilazione/runtime principali:
+Main build dependencies:
 
 ```text
 C compiler
-MariaDB client + mariadb_config
+MariaDB client development files and mariadb_config
 libsodium
 libcurl
 libzip
@@ -1955,7 +98,7 @@ libm
 /home/tools/mcp/work/data/libradio_client.a
 ```
 
-Target:
+Current CGI targets:
 
 ```text
 pguess.cgi
@@ -1969,341 +112,493 @@ pcompletion.cgi
 pft8.cgi
 ```
 
-`pproc.cgi` è il target più dipendente e linka entrambi i layer radio condivisi.
+Generated `.o` and `.cgi` files are build artifacts and must not be edited manually.
 
----
+## Configuration
 
-## 41. Deploy di test
-
-Script:
-
-```sh
-sudo ./deploy_qsoz_test.sh install
-sudo ./deploy_qsoz_test.sh remove
-```
-
-Install:
-
-- crea `/home/www/log/qsoz`;
-- crea symlink verso la directory di lavoro;
-- cambia `qsoz.conf` a `640 mcp:www-data`;
-- rende il sito raggiungibile sotto `/qsoz/`.
-
-Remove:
-
-- rimuove i symlink creati;
-- prova a rimuovere la directory;
-- riporta `qsoz.conf` a `600` e gruppo `mcp`.
-
-Come già indicato, lo script corrente non gestisce `pcty.cgi`.
-
----
-
-## 42. Sicurezza e invarianti importanti
-
-### Non duplicare credenziali callbook
-
-QRZ.com e QRZ.ru devono restare confinati in `work/data/callbookd` / `radio.conf`.
-
-### Non bypassare l'OTA
-
-Le azioni CGI sensibili devono continuare a verificare `user.ota` e scadenza.
-
-### Escaping SQL
-
-Dati utente/callsign/contest devono passare da `mysql_real_escape_string()` o wrapper `qsoz_db_escape()` prima di entrare in query costruite dinamicamente.
-
-### Escaping HTML
-
-Dati provenienti da DB/provider non devono essere stampati direttamente in HTML/JS quando possono contenere caratteri speciali. Usare `qsoz_html_*` secondo il contesto.
-
-### CTY
-
-L'aggiornamento deve restare atomico: import completo su staging prima dello swap.
-
-### Radio shared layer
-
-ADIF, CTY, locator, distance e bearing hanno una implementazione canonica in `work/data`; non ricopiarla nel progetto.
-
-### qrzweb è separato
-
-Il progetto Web Contacts QRZ sviluppato parallelamente vive in:
+All qsoz database and local-service settings are read from:
 
 ```text
-/home/tools/mcp/work/qrzweb
+/home/tools/mcp/work/qsoz/qsoz.conf
 ```
 
-Condivide dati MariaDB rilevanti (`log`, `who` e proprie tabelle `wc/wcsent`) ma non fa parte del build qsoz e deve restare architetturalmente separato dal logger/UI. qsoz usa `callbookd`; qrzweb gestisce invece la specifica logica Web Contacts.
-
----
-
-## 43. Convenzioni di codice del progetto
-
-Per nuovi interventi C mantenere lo stile consolidato del progetto:
-
-- C89 / `gnu89`;
-- dichiarazioni all'inizio dei blocchi;
-- niente dichiarazioni dentro `for`;
-- inizializzazione dopo la dichiarazione;
-- preferire `for` a `while` dove sensato;
-- evitare C99/C11 e POSIX se non necessari;
-- usare la libreria standard o i moduli qsoz/data esistenti prima di creare helper duplicati;
-- attenzione a performance e memoria;
-- nessun codice/variabile inutilizzato;
-- funzioni piccole e leggibili;
-- commenti in inglese con `//`;
-- graffa aperta sulla stessa riga;
-- indentazione 2 spazi;
-- stile compatto.
-
-Quando si modifica comportamento storico delicato, prima verificare il codice reale e preservare la semantica esistente salvo decisione esplicita.
-
----
-
-## 44. Aspetti noti da ricordare
-
-Questi punti non sono automaticamente “bug da correggere”; sono caratteristiche o differenze dello stato attuale da tenere presenti prima di modificare il progetto.
-
-1. `deploy_qsoz_test.sh` non include `pcty.cgi`, produzione sì.
-2. `pradio.c` duplica parte del networking invece di usare `qsoz_net`.
-3. `index.html` non contiene più una versione hardcoded nel titolo; la release globale viene letta esclusivamente da `QSOZ_RELEASE`.
-4. I numeri versione nelle intestazioni dei singoli file non coincidono con la release globale.
-5. `pguess` usa ancora candidati callsign max 6 perché `aux2/aux3` hanno `callsign varchar(6)`, mentre il logger supporta callsign fino a 20.
-6. `ConTX++` è uno stato locale browser (`v[22]`), non parte del filtro cluster 13-bit.
-7. Le regole contest sono implementazioni storiche specifiche del progetto e includono esplicite semplificazioni per alcuni contest.
-8. I file `build_auth*.log`, `.build_no_md5.log` e `.score_before.txt` sono riferimenti diagnostici/storici, non sorgenti runtime.
-9. Gli export ADIF/Cabrillo scrivono file sotto `/home/www/log/files`; la gestione/retention di quei file non è implementata in qsoz.
-10. Il filtro `LFind` è una `LIKE` SQL: non viene aggiunto `%` automaticamente.
-
----
-
-## 45. Checklist di manutenzione
-
-Dopo modifiche a moduli comuni:
+The configuration is parsed by `qsoz_config.c` and contains these logical fields:
 
 ```text
-qsoz_util       -> controllare WPX e scoring
-qsoz_stats      -> controllare Report, Activity, Curio, ConScore, ConGraph
-qsoz_time       -> controllare Start/End, import/export, pcmd
-qsoz_html       -> controllare output callbook/list/cluster
-qsoz_request    -> controllare tutti i pulsanti pproc e upload file
-qsoz_db         -> controllare Start/End + importer
-radio_data      -> controllare CTY, ADIF, locator, scoring
-radio_client    -> controllare QRZ.com/QRZ.ru e Start
-pscore          -> confrontare baseline score
+db_host
+db_user
+db_pass
+db_name
+db_port
+callbook_host
+callbook_port
+callbook_timeout
+cluster_host
+cluster_port
+cluster_timeout
 ```
 
-Test WPX disponibile:
+The file contains credentials and must never be exposed through the web server, copied into source files, printed in logs, or committed to a public repository.
 
-```sh
-./```
-
-Per il motore contest conservare `.score_before.txt` come baseline finché non esiste una suite automatizzata più completa.
-
----
-
-## 46. Principio di evoluzione
-
-qsoz contiene logiche costruite e verificate nel tempo, soprattutto su scoring, import/export, radio e flusso operativo. La regola di manutenzione deve essere:
-
-> preservare la strategia e la semantica che funzionano; sostituire meccanismi fragili solo quando il nuovo comportamento è misurabile e verificato.
-
-Prima di rimuovere una funzione, una regola contest, un campo, una query o una scelta operativa storica, verificarne gli utilizzi e discuterne l'effetto. Ottimizzazioni interne sono desiderabili quando non cambiano il risultato osservabile.
-
----
-
-## 47. Completion database rebuild (`a33`, `pcompletion.cgi`)
-
-Release 3.09 aggiunge una funzione amministrativa dedicata alla ricostruzione del database di completion usato da `pguess.cgi`.
-
-UI:
+Current production permissions are intended to allow the CGI user to read the configuration without making it public:
 
 ```text
-a33 Completion
+640 mcp:www-data qsoz.conf
 ```
 
-Il bottone compare dopo il login soltanto quando il callsign inserito nel login è `IK4LZH`. Questa è una comodità UI, non il controllo di sicurezza: `pcompletion.cgi` verifica nuovamente l'OTA lato server e rifiuta qualsiasi sessione che non appartenga a IK4LZH.
+## Authentication and OTA sessions
 
-L'output viene mostrato nel pannello destro `out2`, come l'aggiornamento CTY.
+Login is handled by `plogin.cgi`.
 
-Endpoint e sorgente unico:
+Passwords are verified with libsodium. A successful login returns a temporary 16-character OTA token together with the user page size and filter state. The browser then sends the OTA token with subsequent operations.
+
+The `user` table stores the OTA token, its creation/last-use time and validity duration. Server-side authorization must always validate the OTA token; hiding a browser control is never considered a security boundary.
+
+Administrative CGI programs additionally verify the authenticated callsign. `pcty.cgi` and `pcompletion.cgi` are restricted to `IK4LZH` on the server side.
+
+## Browser frontend
+
+`index.html` is intentionally small and uses vanilla JavaScript only. The page title is:
+
+```html
+<title>LOG by IK4LZH</title>
+```
+
+No release number is hardcoded in the title. The displayed release is fetched from:
 
 ```text
-pcompletion.cgi
-pcompletion.c
+ptime.cgi?release
 ```
 
-Non esiste un modulo separato `qsoz_completion`: la funzione appartiene esclusivamente a questo CGI amministrativo.
+which returns `QSOZ_RELEASE` from `qsoz_version.h`.
 
-### Sorgenti e semantica
+The browser maintains:
 
-Vengono considerati tutti i callsign di `log` di tutti gli utenti e tutti quelli di `wc`.
+- current OTA token;
+- pagination offset and page size;
+- current QSO Start timestamp;
+- local filter/check state;
+- radio memories and current radio state;
+- two independent output areas.
 
-La trasformazione riproduce la precedente procedura SQL:
+Calls to `pguess.cgi` are made while editing the callsign field. Most application actions go to `pproc.cgi`. CTY and completion maintenance use their dedicated CGI endpoints.
 
-1. trim degli spazi iniziali/finali;
-2. uppercase ASCII;
-3. accettazione solo se l'intero callsign normalizzato è `[A-Z0-9]+`;
-4. solo dopo la validazione, conservazione dei primi 6 caratteri;
-5. deduplicazione globale tra `log` e `wc`;
-6. generazione di tutti i bigrammi consecutivi in `aux2`;
-7. generazione di tutti i trigrammi consecutivi in `aux3`;
-8. eliminazione dei grammi duplicati per lo stesso callsign.
+## Main browser request protocol
 
-È importante che la validazione avvenga prima del taglio a 6 caratteri: un callsign contenente `/` o altri caratteri non validi resta escluso, esattamente come nella SQL originale.
-
-### Implementazione C
-
-MariaDB viene usato per streaming dei callsign, insert batch, creazione indici e swap finale. Normalizzazione, validazione, deduplica e generazione dei grammi avvengono in C.
-
-I callsign normalizzati sono conservati in una hash table open-addressing dinamica. Gli insert dei grammi vengono aggregati in query batch con buffer fino a circa 1 MiB.
-
-Le tabelle staging vengono create con `CREATE TABLE ... LIKE`, poi gli indici vengono temporaneamente rimossi durante il caricamento e ricreati soltanto a fine inserimento:
+Requests to `pproc.cgi` contain 13 fixed CSV fields followed by an optional Base64 payload. The frontend currently sends:
 
 ```text
-PRIMARY KEY(callsign,gram)
-KEY gram(gram)
+0   OTA
+1   action id (a01 ... a31)
+2   base / pagination offset
+3   page size
+4   callsign
+5   TX frequency
+6   mode
+7   TX report
+8   RX report
+9   contest
+10  contest TX exchange
+11  contest RX exchange
+12  action-specific state
++   optional Base64 file payload
 ```
 
-### Staging e swap atomico
+`qsoz_request.c` performs bounded parsing. The decoded file payload is limited to 20,000,000 bytes. Base64 parsing checks malformed input, truncation, padding and overflow.
 
-Il rebuild non esegue più `TRUNCATE` sulle tabelle di produzione attive.
+CGI responses include an HTML comment identifying the action number so the browser can route the result to the appropriate output pane.
 
-Flusso:
+## UI actions
+
+The current action map is:
+
+| Action | UI label | Purpose |
+| --- | --- | --- |
+| `a01` | List | Reset and display the main QSO list |
+| `a02` | Up | Previous main-list page |
+| `a03` | Down | Next main-list page |
+| `a04` | R | Refresh the main list |
+| `a05` | G | Locate a list offset from a `YYYYMMDD` date entered in Call |
+| `a06` | LFind | Reset callsign search |
+| `a07` | Up | Previous callsign-search page |
+| `a08` | Down | Next callsign-search page |
+| `a09` | Apply | Resolve unresolved `log.dxcc` values through CTY |
+| `a10` | Report | Band/mode, unique, WPX, DXCC and QSL statistics |
+| `a11` | Curio | Callsign/band/mode/QSL rankings |
+| `a12` | Activity | Year/month/day activity statistics |
+| `a13` | Cluster | Enriched DX Cluster view |
+| `a14` | ConGraph | Contest score graph |
+| `a15` | adi-> | ADIF import |
+| `a16` | lzh-> | Historical LZH-format import |
+| `a17` | QSL.lotw | LoTW confirmation import |
+| `a18` | QSL.eqsl | eQSL confirmation import |
+| `a19` | QSL.qrz | QRZ confirmation import |
+| `a20` | ->adi | ADIF export |
+| `a21` | ->cbr | Cabrillo export |
+| `a22` | cbr-> | Cabrillo import |
+| `a23` | Start | Start QSO context and analyze the remote station |
+| `a24` | QRZ.com | QRZ.com lookup through the local callbook service |
+| `a25` | QRZ.ru | QRZ.ru lookup through the local callbook service |
+| `a26` | End | Close and store the QSO |
+| `a27` | ConList | List contests present in the log |
+| `a28` | LCon | Reset selected-contest QSO list |
+| `a29` | Up | Previous contest-list page |
+| `a30` | Down | Next contest-list page |
+| `a31` | ConScore | Calculate contest score |
+| `a32` | CTY | Run `pcty.cgi`, IK4LZH only |
+| `a33` | Completion | Run `pcompletion.cgi`, IK4LZH only |
+
+`a32` and `a33` do not pass through `pproc.cgi`.
+
+## QSO Start/End flow
+
+### Start (`a23`)
+
+The browser sends the current callsign, frequency, mode and reports. The server builds the QSO context without inserting a log row yet.
+
+The Start operation:
+
+1. records the server-side Start timestamp;
+2. resolves the remote station through the CTY database;
+3. displays country/base prefix, DXCC, continent, CQ/ITU zones, coordinates and GMT shift;
+4. resolves the operator station as well;
+5. calculates CTY-based distance and bearing;
+6. uses Maidenhead locators from `who` when available for locator-based distance/bearing;
+7. shows previous QSOs and QSL information relevant to the station;
+8. returns the Start timestamp to the browser.
+
+The browser keeps that Start timestamp until `a26`.
+
+### End (`a26`)
+
+End validates the current fields, builds the final database row and stores the QSO. Contest exchange and selected contest state are included when applicable.
+
+The Start/End split is deliberate: Start performs lookups and operator feedback, while End is the persistent write operation.
+
+## Frequencies, bands and modes
+
+Shared band/mode normalization is implemented in `qsoz_util.c` and in the shared radio-data layer where appropriate.
+
+The logger works internally with radio frequencies and maps them to amateur bands for reports, QSO history and contest calculations. Mode families used by reporting/scoring normalize operating modes into the categories required by the corresponding function or contest.
+
+Do not duplicate band/mode tables in new CGI programs if an existing shared helper already provides the required semantics.
+
+## Database
+
+MariaDB is the persistent store. The schema is shared with related radio tools, so database changes must preserve compatibility with existing consumers.
+
+### `user`
+
+Stores authentication/session and user preferences, including:
 
 ```text
-log + wc
-   |
-   v
-hash callsign unica in RAM
-   |
-   v
-aux2_new / aux3_new senza indici
-   |
-   v
-insert batch bigrammi / trigrammi
-   |
-   v
-creazione PK + indice gram
-   |
-   v
-validazione COUNT(*)
-   |
-   v
-RENAME TABLE atomico
+mycall
+password hash
+OTA token
+OTA time / duration
+page size
+filter state
+radio selection
+user-defined fields
 ```
 
-Lo swap finale è unico:
+`mycall` is the logical user key.
 
-```sql
-RENAME TABLE
-  aux2 TO aux2_old,
-  aux2_new TO aux2,
-  aux3 TO aux3_old,
-  aux3_new TO aux3;
-```
+### `log`
 
-Fino a quel momento `pguess.cgi` continua a utilizzare le vecchie `aux2/aux3`. Se il rebuild fallisce prima dello swap, le tabelle attive restano intatte.
+The central QSO table. It stores timestamps, operator callsign, remote callsign, frequencies, mode, signal reports, contest data, DXCC and QSL state.
 
-Dopo uno swap riuscito `aux2_old/aux3_old` vengono eliminate.
+The table is large and performance-sensitive. Avoid unnecessary full-table scans in interactive paths. Existing indexes and their historical query behavior must be reviewed before adding/removing indexes.
 
-### Lock amministrativo
+### `who`
 
-Il CGI acquisisce l'advisory lock MariaDB:
+Stores station/callsign metadata such as locator information used for distance/bearing calculations and other station context.
+
+### `cty`
+
+Local CTY/prefix database used for callsign resolution. It contains prefix, base prefix, country/entity information, DXCC, continent, CQ/ITU zone, coordinates and GMT shift.
+
+The database is maintained by `pcty.cgi` rather than by normal QSO actions.
+
+### `aux2` and `aux3`
+
+Completion indexes used by `pguess.cgi`:
 
 ```text
-qsoz_completion_rebuild
+aux2  callsign + 2-character gram
+aux3  callsign + 3-character gram
 ```
 
-con timeout zero. Due rebuild non possono quindi essere eseguiti contemporaneamente.
+Both tables have a primary key on `(callsign, gram)` and an index on `gram`.
 
-### Validazione reale del 18 agosto 2026
+They are rebuilt by `pcompletion.cgi` from valid callsigns found in `log` and `wc`.
 
-Il nuovo algoritmo C è stato eseguito sul database reale e confrontato con query read-only equivalenti alla procedura SQL originale.
+## Callsign completion (`pguess.cgi`)
 
-Risultato C:
+`pguess.cgi` is a dedicated low-latency endpoint called while the user types a callsign.
+
+It uses trigram and bigram overlap from `aux3` and `aux2` to obtain a bounded candidate set, then completes fuzzy ranking in C using exact edit-distance logic. The endpoint returns clickable callsign suggestions as HTML.
+
+The completion database is intentionally precomputed so the interactive request does not repeatedly scan the QSO log.
+
+## Completion database rebuild (`pcompletion.cgi`)
+
+`pcompletion.cgi` is an independent administrative CGI and is restricted to `IK4LZH` both in the UI and on the server side.
+
+Its source set is equivalent to the historical completion SQL logic:
 
 ```text
-log rows scanned:    1210077
-wc rows scanned:      243762
-valid source rows:   1427110
-unique callsigns:     239966
-aux2 bigrams:        1064138
-aux3 trigrams:        825541
-elapsed:              circa 10 secondi
+all callsigns from log
+UNION
+all callsigns from wc
 ```
 
-Riferimento SQL indipendente:
+Normalization rules are:
+
+1. trim surrounding spaces;
+2. uppercase ASCII letters;
+3. reject the full normalized callsign unless every character is `A-Z` or `0-9`;
+4. only after validation, keep the first six characters;
+5. deduplicate callsigns;
+6. generate distinct bigrams and trigrams for each callsign.
+
+Validation is deliberately performed before truncation. A callsign containing `/` or another invalid character must not become valid merely because the invalid part would be removed by truncation.
+
+The implementation keeps most of the expensive transformation work in C:
+
+- source rows are streamed from MariaDB;
+- normalized callsigns are deduplicated in an in-memory open-addressing hash table;
+- bigrams/trigrams are generated in C;
+- rows are inserted in large multi-value batches.
+
+For safe replacement, the CGI builds temporary tables first:
 
 ```text
-calls       239966
-aux2_ref   1064138
-aux3_ref    825541
+aux2_new
+aux3_new
 ```
 
-I conteggi coincidono esattamente.
+Indexes are created after bulk insertion. Row counts are validated, then both live tables are replaced with one atomic `RENAME TABLE` operation. Users of `pguess.cgi` therefore continue to see valid `aux2`/`aux3` data throughout the rebuild.
 
-### Relazione con `pguess.cgi`
+A MariaDB named lock prevents two completion rebuilds from running concurrently.
 
-`pguess.cgi` non è stato modificato. Continua a usare `aux3` per i trigrammi e `aux2` per i bigrammi, seleziona fino a 400 candidati e completa l'ordinamento fuzzy con Levenshtein in C.
+## CTY maintenance (`pcty.cgi`)
 
+`pcty.cgi` is the dedicated CTY update endpoint and is restricted to `IK4LZH`.
 
----
+It downloads and processes the CTY source, builds replacement data and uses staging/swap semantics rather than leaving the live CTY table partially updated.
 
-## FT8 symmetricity CGI
+Normal QSO processing must not perform CTY database maintenance implicitly.
 
-Il progetto contiene anche `pft8.c`, compilato come `pft8.cgi`, che sostituisce la precedente pagina PHP `ft8.chaos.cc` basata su `symmetricity.php`, `utility.php` e Google Charts.
+## Radio control (`pradio.cgi` and shared radio layer)
 
-Il CGI è autonomo lato presentazione: genera direttamente HTML, CSS e SVG e non carica librerie JavaScript o grafiche esterne. Usa soltanto MariaDB e `libm` in fase di link.
+Radio access is isolated from the main reporting/database code.
 
-Analizza globalmente i QSO `mode='FT8'` o `mode='MFSK'` di tutti gli utenti. Sono inclusi nella statistica soltanto record con `signaltx`, `signalrx` e delta `signaltx-signalrx` tutti nell'intervallo `-35..+35 dB`. Il denominatore della distribuzione, media e deviazione standard usa esattamente lo stesso insieme di QSO visualizzato.
+The current stack supports the TS-890S path and a `rigctld` path. Shared radio protocol/data code lives under:
 
-Le sezioni prodotte sono:
+```text
+/home/tools/mcp/work/data
+```
 
-- PDF di `TX-RX` per banda 160/80/60/40/30/20/17/15/12/10 metri e totale;
-- QSO, media e deviazione standard per banda e totale;
-- andamento temporale per CQ zone, mantenendo il bucket temporale storico della precedente implementazione PHP.
+and is linked into `pproc.cgi` through:
 
-### Cache FT8
+```text
+libradio_data.a
+libradio_client.a
+```
 
-Una scansione completa interessa oltre un milione di QSO FT8/MFSK e richiede circa 2.6 secondi sul database corrente. Per evitare di ripeterla a ogni accesso, `pft8.cgi` mantiene una cache binaria runtime:
+`pradio.cgi` handles browser radio operations, while `pproc.cgi` uses the shared libraries for QSO-related radio data.
+
+Do not duplicate protocol constants or radio-state decoding inside unrelated CGI programs.
+
+## Callbook service
+
+QRZ.com and QRZ.ru lookups are requested through the configured local callbook service rather than embedding remote-service credentials or HTTP logic in the browser.
+
+The two UI actions are:
+
+```text
+a24 QRZ.com
+a25 QRZ.ru
+```
+
+Remote credentials belong to the callbook service/configuration layer and must not be copied into `qsoz` source code or README files.
+
+## DX Cluster
+
+`a13` provides an enriched DX Cluster view using the configured cluster host/port and local QSO/CTY context.
+
+Network access uses bounded timeouts. Cluster connectivity failures must remain local to the cluster action and must not block unrelated logger functions.
+
+## Import, export and QSL confirmation
+
+Supported file operations are intentionally handled by explicit actions:
+
+```text
+a15  ADIF import
+a16  historical LZH import
+a17  LoTW confirmation import
+a18  eQSL confirmation import
+a19  QRZ confirmation import
+a20  ADIF export
+a21  Cabrillo export
+a22  Cabrillo import
+```
+
+Uploaded data is sent as a Base64 payload through the bounded request parser. Imports must validate fields before constructing database writes. Exports are generated from the authenticated user's data and current action parameters.
+
+## Reports and activity
+
+The main reporting operations are:
+
+```text
+a10  Report
+a11  Curio
+a12  Activity
+```
+
+They reuse shared band/mode, WPX, time and in-memory aggregation helpers where possible.
+
+`qsoz_stats.c` provides the bounded in-memory aggregation structure used by reporting and contest scoring. The limits in `qsoz_stats.h` are part of the current resource-control design and should not be increased casually.
+
+## Contest support
+
+Contest functions are integrated into the main logger rather than implemented as separate programs.
+
+Relevant actions:
+
+```text
+a14  contest score graph
+a27  contest list
+a28  selected-contest QSO list
+a29  previous contest page
+a30  next contest page
+a31  contest score
+```
+
+Contest scoring is implemented primarily in `pscore.c` with shared statistics, utility and radio data. The scorer supports the contest families encoded in the current source and preserves contest-specific exchange, multiplier and scoring semantics.
+
+When changing contest logic, verify both the individual contest rule and regressions in unrelated contests. `.score_before.txt` is a local regression reference and is not part of the runtime application.
+
+## Shared utility modules
+
+### `qsoz_config.c` / `qsoz_config.h`
+
+Loads the fixed project configuration into a bounded `QsozConfig` structure.
+
+### `qsoz_db.c` / `qsoz_db.h`
+
+Database helpers for bounded escaping and construction of QSO values used by database writes.
+
+### `qsoz_html.c` / `qsoz_html.h`
+
+HTML/attribute/JavaScript-safe output helpers used where generated content contains external or database-derived strings.
+
+### `qsoz_net.c` / `qsoz_net.h`
+
+Small TCP client helpers with timeout handling and line-oriented reads.
+
+### `qsoz_request.c` / `qsoz_request.h`
+
+Bounded parser for the 13-field request protocol plus optional Base64 payload.
+
+### `qsoz_stats.c` / `qsoz_stats.h`
+
+Bounded in-memory keyed aggregation used by reports and contest scoring.
+
+### `qsoz_time.c` / `qsoz_time.h`
+
+UTC/date/epoch conversion helpers.
+
+### `qsoz_util.c` / `qsoz_util.h`
+
+Shared band, mode, WPX, PACC, elapsed-time, token and bounded-copy helpers.
+
+## FT8/MFSK analytics (`pft8.cgi`)
+
+`pft8.cgi` serves the separate site:
+
+```text
+https://ft8.chaos.cc/
+```
+
+It replaces the previous PHP/Google-Charts implementation with one compiled CGI. The CGI generates its own HTML, CSS and SVG; no JavaScript chart library is loaded by the page.
+
+The data source is the shared QSO `log` table. The analysis considers rows with:
+
+```text
+mode = FT8 or MFSK
+signaltx in [-35,+35]
+signalrx in [-35,+35]
+(signaltx - signalrx) in [-35,+35]
+```
+
+The same accepted set is used for the displayed probability distribution and its denominator, so PDF normalization, QSO count, average and standard deviation are consistent.
+
+The page currently provides:
+
+- TX-RX probability distributions by amateur band and overall;
+- QSO count, average TX-RX difference and standard deviation;
+- time/CQ-zone activity visualization.
+
+The CQ-zone time bucket calculation intentionally preserves the semantics of the previous implementation.
+
+### FT8 cache
+
+A complete FT8/MFSK scan is expensive on a large log, so `pft8.cgi` stores only the computed aggregates in:
 
 ```text
 /home/www/ft8/.pft8.cache
 ```
 
-La cache contiene soltanto gli aggregati già calcolati, non l'HTML. La chiave di validità comprende:
+The cache is binary and is not a rendered-page cache. It is accepted only when its internal magic/version and database key match.
+
+The current invalidation key includes information derived from:
 
 ```text
-UPDATE_TIME di log
-UPDATE_TIME di cty
+log UPDATE_TIME
+cty UPDATE_TIME
 MAX(log.open)
-stima TABLE_ROWS di log
+log TABLE_ROWS estimate
 ```
 
-Se uno di questi valori cambia il CGI rifà l'analisi completa e sostituisce la cache atomicamente. Se non cambia, carica direttamente gli aggregati e genera gli SVG senza scandire `log`.
+If the key changes, the CGI recomputes the aggregate data and replaces the cache atomically. If the key is unchanged, the CGI reads the small aggregate cache and renders the SVG output without scanning the QSO table again.
 
-Misure effettuate sul deployment reale il 19 agosto 2026:
+Apache already compresses the generated HTML/SVG with `mod_deflate`; manual compression in the CGI is unnecessary.
+
+## Production deployment
+
+### Main logger
+
+The main site is served from:
 
 ```text
-prima richiesta, cache assente: circa 2.66 s
-richiesta successiva, cache valida: circa 0.016 s
-cache binaria: circa 43 KB
-HTML/SVG non compresso: circa 404 KB
-risposta HTTP gzip: circa 46 KB
+/home/www/log
 ```
 
-Apache ha già `mod_deflate` attivo e invia `Content-Encoding: gzip`, quindi non è necessario comprimere manualmente l'output nel CGI.
+The operational files are symbolic links into `/home/tools/mcp/work/qsoz`. The expected CGI setup is equivalent to:
 
-### Deployment reale `ft8.chaos.cc`
+```apache
+DirectoryIndex index.html
+AddHandler cgi-script .cgi
 
-Il CGI è esposto tramite:
+<Directory /home/www/log>
+  Options +ExecCGI -Indexes -MultiViews
+  Require all granted
+</Directory>
+```
+
+The application must not expose `qsoz.conf` through the DocumentRoot.
+
+### FT8 site
+
+The current FT8 link is:
 
 ```text
 /home/www/ft8/pft8.cgi -> /home/tools/mcp/work/qsoz/pft8.cgi
 ```
 
-Il virtual host HTTPS è configurato con `pft8.cgi` come unico file di indice predefinito e con esecuzione CGI esplicita:
+The HTTPS virtual host uses:
 
 ```apache
 DocumentRoot /home/www/ft8
@@ -2316,10 +611,143 @@ AddHandler cgi-script .cgi
 </Directory>
 ```
 
-Il precedente handler PHP non è più necessario per la pagina di default. I vecchi symlink `symmetricity.php`, `utility.php` e `local.php` possono essere rimossi separatamente quando non servono più; `pft8.cgi` non dipende da essi.
+`pft8.cgi` is the default application for `ft8.chaos.cc` and does not depend on the old PHP files.
 
-La pagina pubblica corrente è quindi:
+## Test deployment
+
+`deploy_qsoz_test.sh` installs a test set of symbolic links under:
 
 ```text
-https://ft8.chaos.cc/
+/home/www/log/qsoz
 ```
+
+Run as root:
+
+```sh
+sudo ./deploy_qsoz_test.sh install
+sudo ./deploy_qsoz_test.sh remove
+```
+
+The script also adjusts `qsoz.conf` group/permissions so Apache can read it during the test deployment.
+
+The script is a convenience for the main qsoz interface; it is not the deployment mechanism for the separate FT8 virtual host.
+
+## Security invariants
+
+The following rules are part of the application design:
+
+1. Never expose or duplicate credentials from `qsoz.conf` or other local service configurations.
+2. Never trust a hidden browser control as authorization; validate OTA and privileges in the CGI.
+3. Escape SQL data with the existing database helpers or MariaDB escaping before constructing SQL text.
+4. Escape database/external strings before embedding them in HTML, attributes or JavaScript.
+5. Keep file-upload size and parser bounds intact unless there is a demonstrated need to change them.
+6. Keep CTY and completion rebuilds isolated from normal QSO processing.
+7. Use staging plus atomic replacement for large administrative database rebuilds when readers must remain available.
+8. Do not print secrets, password hashes, OTA tokens or remote-service credentials to diagnostic output.
+9. Preserve timeout handling for network/radio services so an unavailable external component cannot block the logger indefinitely.
+10. Treat the shared MariaDB schema and shared radio libraries as interfaces used by other projects; review compatibility before changing them.
+
+## Coding standard
+
+C code in this project follows the current project conventions:
+
+- C89/gnu89 source style;
+- declarations at the beginning of the function/block;
+- initialization after declarations;
+- prefer `for` to `while` when it keeps the code simpler;
+- use standard-library functions instead of unnecessary helper wrappers;
+- avoid allocations and copies that do not provide a measurable benefit;
+- no unused variables, functions or dead code;
+- comments in English only and only when they add information;
+- `//` comments;
+- opening brace on the same line as the statement, with one space before it;
+- two-space indentation;
+- small functions with explicit bounds and error paths;
+- performance-sensitive code should stream or aggregate rather than materialize unnecessary intermediate data.
+
+Source headers keep the historical project start year and the file's own revision, for example:
+
+```c
+// Gianluca Mazzini @2022- Version 3.xx
+```
+
+The application release is independent and comes only from `qsoz_version.h`.
+
+## File inventory
+
+### Frontend and build
+
+```text
+index.html             browser UI and request orchestration
+qsoz.css               main logger stylesheet
+Makefile               production build
+qsoz_version.h         global application release
+qsoz.conf              private runtime configuration
+deploy_qsoz_test.sh    test symlink deployment helper
+```
+
+### CGI sources
+
+```text
+plogin.c       login and OTA creation
+ptime.c        server epoch and release endpoint
+pguess.c       interactive callsign suggestions
+pcmd.c         direct QSO edit/delete
+pradio.c       radio polling/control
+pproc.c        main application CGI
+pcty.c         CTY administrative rebuild
+pcompletion.c  callsign-completion administrative rebuild
+pft8.c         standalone FT8/MFSK analytics CGI
+```
+
+### Shared qsoz sources
+
+```text
+pscore.c / pscore.h
+qsoz_config.c / qsoz_config.h
+qsoz_db.c / qsoz_db.h
+qsoz_html.c / qsoz_html.h
+qsoz_net.c / qsoz_net.h
+qsoz_request.c / qsoz_request.h
+qsoz_stats.c / qsoz_stats.h
+qsoz_time.c / qsoz_time.h
+qsoz_util.c / qsoz_util.h
+```
+
+### Local non-runtime references
+
+The working directory may contain local build logs and regression references such as:
+
+```text
+build_auth.log
+build_auth2.log
+.build_no_md5.log
+.score_before.txt
+```
+
+They are not required by the running application and must not be confused with runtime configuration or generated binaries.
+
+## Maintenance checklist
+
+Before changing qsoz:
+
+1. Identify whether the behavior belongs in `pproc.cgi` or deserves an independent CGI.
+2. Check for an existing shared helper before adding duplicate logic.
+3. Preserve OTA authorization and privilege checks.
+4. Preserve the current database semantics before attempting optimization.
+5. Compile with the existing `-Wall -Wextra` flags and resolve new warnings.
+6. Test the specific changed path and at least one unaffected core path.
+7. For database rebuilds, verify source counts/result counts before replacing live tables.
+8. For performance changes, measure the real bottleneck instead of assuming SQL or C is responsible.
+9. Keep `qsoz_version.h` as the single global release source.
+10. Update this README to describe the resulting current state, not the implementation history.
+
+## Related projects
+
+`qrzweb` is a separate project even though it shares parts of the same radio/database ecosystem. Its source is maintained separately under:
+
+```text
+/home/tools/mcp/work/qrzweb
+```
+
+Do not merge qrzweb-specific web workflows into qsoz merely because some database tables are shared.
