@@ -1,4 +1,4 @@
-// Gianluca Mazzini @2022- Version 4.2
+// Gianluca Mazzini @2022- Version 4.12
 #include <ctype.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -8,15 +8,16 @@
 #include <unistd.h>
 #include <arpa/inet.h>
 #include <sys/socket.h>
-#include <mysql/mysql.h>
+#include "qsoz_db.h"
 #include "qsoz_util.h"
 #include "qsoz_stats.h"
 #include "qsoz_net.h"
 #include "qsoz_request.h"
-#include "qsoz_db.h"
 #include "qsoz_html.h"
 #include "qsoz_time.h"
 #include "qsoz_config.h"
+#include "qsoz_user.h"
+#include "qsoz_cache.h"
 #include "/home/tools/mcp/work/data/radio_client.h"
 #include "/home/tools/mcp/work/data/radio_data.h"
 #define QSLWIN 240
@@ -83,36 +84,30 @@ typedef struct {
   char spotter[20],dx[20];
 } QsozClusterSpot;
 
-static void print_callbook_result(MYSQL *con,const char *esc_call,const char *response) {
-  MYSQL_RES *res;
-  MYSQL_ROW row;
-  char query[1024],h1[2048],h2[2048],h3[2048],h4[2048];
+static void print_callbook_result(const char *call,const char *response) {
+  RadioWho who;
+  char h1[2048],h2[2048],h3[2048],h4[2048],num[32];
+  int rc;
 
   printf("<pre>");
   if(qsoz_html_text(h1,sizeof(h1),response))printf("%s",h1);
-  snprintf(query,sizeof(query),"select firstname,lastname,addr1,addr2,state,zip,country,grid,email,cqzone,ituzone,born,src,image from who where callsign='%s'",esc_call);
-  if(mysql_query(con,query)!=0){printf("Callbook database error\n</pre>"); return;}
-  res=mysql_store_result(con);
-  if(res==NULL){printf("Callbook database error\n</pre>"); return;}
-  row=mysql_fetch_row(res);
-  if(row==NULL){
-    printf("No callbook data stored\n</pre>");
-    mysql_free_result(res);
-    return;
-  }
-  qsoz_html_text(h1,sizeof(h1),row[0]); qsoz_html_text(h2,sizeof(h2),row[1]);
+  rc=radio_who_lookup(call,&who);
+  if(rc<0){printf("Callbook database error\n</pre>"); return;}
+  if(rc==0){printf("No callbook data stored\n</pre>"); return;}
+  qsoz_html_text(h1,sizeof(h1),who.firstname); qsoz_html_text(h2,sizeof(h2),who.lastname);
   printf("\n%s %s\n",h1,h2);
-  qsoz_html_text(h1,sizeof(h1),row[2]); qsoz_html_text(h2,sizeof(h2),row[3]);
+  qsoz_html_text(h1,sizeof(h1),who.addr1); qsoz_html_text(h2,sizeof(h2),who.addr2);
   printf("%s\n%s\n",h1,h2);
-  qsoz_html_text(h1,sizeof(h1),row[4]); qsoz_html_text(h2,sizeof(h2),row[5]); qsoz_html_text(h3,sizeof(h3),row[6]);
+  qsoz_html_text(h1,sizeof(h1),who.state); qsoz_html_text(h2,sizeof(h2),who.zip); qsoz_html_text(h3,sizeof(h3),who.country);
   printf("%s %s %s\n",h1,h2,h3);
-  qsoz_html_text(h1,sizeof(h1),row[7]); qsoz_html_text(h2,sizeof(h2),row[8]);
+  qsoz_html_text(h1,sizeof(h1),who.grid); qsoz_html_text(h2,sizeof(h2),who.email);
   printf("grid:%s email:%s\n",h1,h2);
-  qsoz_html_text(h1,sizeof(h1),row[9]); qsoz_html_text(h2,sizeof(h2),row[10]); qsoz_html_text(h3,sizeof(h3),row[11]); qsoz_html_text(h4,sizeof(h4),row[12]);
+  snprintf(num,sizeof(num),"%d",who.cqzone); qsoz_html_text(h1,sizeof(h1),num);
+  snprintf(num,sizeof(num),"%d",who.ituzone); qsoz_html_text(h2,sizeof(h2),num);
+  snprintf(num,sizeof(num),"%d",who.born); qsoz_html_text(h3,sizeof(h3),num); qsoz_html_text(h4,sizeof(h4),who.src);
   printf("cq:%s itu:%s born:%s source:%s\n",h1,h2,h3,h4);
   printf("</pre>");
-  if(row[13]!=NULL && row[13][0]!='\0' && qsoz_html_attr(h1,sizeof(h1),row[13]))printf("<img src=\"%s\" width=\"200\" style=\"cursor:zoom-in\" onclick=\"openImgExact(this.src)\">",h1);
-  mysql_free_result(res);
+  if(who.image[0]!='\0' && qsoz_html_attr(h1,sizeof(h1),who.image))printf("<img src=\"%s\" width=\"200\" style=\"cursor:zoom-in\" onclick=\"openImgExact(this.src)\">",h1);
 }
 
 static int cluster_first_dxcc(QsozClusterSpot *spot,int index) {
@@ -122,53 +117,36 @@ static int cluster_first_dxcc(QsozClusterSpot *spot,int index) {
   return 1;
 }
 
-static void cluster_dxcc_stats(MYSQL *con,const char *esc_mycall,QsozClusterSpot *spot,int count) {
-  MYSQL_RES *res;
-  MYSQL_ROW row;
+static void cluster_dxcc_stats(QsozDb *con,const char *mycall,const char *esc_mycall,QsozClusterSpot *spot,int count) {
+  QsozResult *res;
+  QsozRow row;
   char *query,*p;
   unsigned long cap,left;
-  long long now;
-  int i,dxcc,n,stale,first;
+  long qso,qsl;
+  long long now,updated;
+  int i,dxcc,n,stale,first,rc;
 
   if(count<=0)return;
   now=(long long)time(NULL);
-  cap=1024UL+(unsigned long)count*32UL;
-  query=(char *)malloc((size_t)cap);
-  if(query==NULL)return;
-
-  n=snprintf(query,(size_t)cap,"select dxcc,qso,qsl,time from aux1 where mycall='%s' and dxcc in (",esc_mycall);
-  if(n<0 || (unsigned long)n>=cap){free(query); return;}
-  p=query+n;
-  left=cap-(unsigned long)n;
-  first=1;
   for(i=0;i<count;i++){
     if(!cluster_first_dxcc(spot,i))continue;
-    n=sprintf(p,"%s%d",first?"":",",spot[i].dxcc);
-    if(n<0 || (unsigned long)n>=left){free(query); return;}
-    p+=n; left-=(unsigned long)n; first=0;
-  }
-  if(first || left<=2UL){free(query); return;}
-  strcpy(p,")");
-  if(mysql_query(con,query)!=0){free(query); return;}
-  res=mysql_store_result(con);
-  if(res==NULL){free(query); return;}
-  for(;;){
-    row=mysql_fetch_row(res);
-    if(row==NULL)break;
-    if(now-atoll(row[3])>=TIMEOUT_AUX1)continue;
-    dxcc=atoi(row[0]);
-    for(i=0;i<count;i++)if(spot[i].dxcc==dxcc){
-      spot[i].dxcc_qso=atol(row[1]);
-      spot[i].dxcc_qsl=atol(row[2]);
-      spot[i].dxcc_cache_fresh=1;
+    rc=qsoz_cache_dxcc_get(mycall,spot[i].dxcc,&qso,&qsl,&updated);
+    if(rc==1 && now-updated<TIMEOUT_AUX1){
+      for(dxcc=i;dxcc<count;dxcc++)if(spot[dxcc].dxcc==spot[i].dxcc){
+        spot[dxcc].dxcc_qso=qso;
+        spot[dxcc].dxcc_qsl=qsl;
+        spot[dxcc].dxcc_cache_fresh=1;
+      }
     }
   }
-  mysql_free_result(res);
 
   stale=0;
   for(i=0;i<count;i++)if(!spot[i].dxcc_cache_fresh){stale=1; break;}
-  if(!stale){free(query); return;}
+  if(!stale)return;
 
+  cap=1024UL+(unsigned long)count*32UL;
+  query=(char *)malloc((size_t)cap);
+  if(query==NULL)return;
   n=snprintf(query,(size_t)cap,"select dxcc,count(*),coalesce(sum(lotw)+sum(eqsl)+sum(qrz),0) from log where mycall='%s' and dxcc in (",esc_mycall);
   if(n<0 || (unsigned long)n>=cap){free(query); return;}
   p=query+n;
@@ -182,38 +160,28 @@ static void cluster_dxcc_stats(MYSQL *con,const char *esc_mycall,QsozClusterSpot
   }
   if(first || left<=strlen(") group by dxcc")){free(query); return;}
   strcpy(p,") group by dxcc");
-  if(mysql_query(con,query)!=0){free(query); return;}
-  res=mysql_store_result(con);
+  if(qsoz_db_query(con,query)!=0){free(query); return;}
+  res=qsoz_db_result(con);
   if(res==NULL){free(query); return;}
   for(;;){
-    row=mysql_fetch_row(res);
+    row=qsoz_db_fetch(res);
     if(row==NULL)break;
     dxcc=atoi(row[0]);
+    qso=atol(row[1]);
+    qsl=atol(row[2]);
+    qsoz_cache_dxcc_set(mycall,dxcc,qso,qsl,now);
     for(i=0;i<count;i++)if(spot[i].dxcc==dxcc && !spot[i].dxcc_cache_fresh){
-      spot[i].dxcc_qso=atol(row[1]);
-      spot[i].dxcc_qsl=atol(row[2]);
+      spot[i].dxcc_qso=qso;
+      spot[i].dxcc_qsl=qsl;
     }
   }
-  mysql_free_result(res);
-
-  n=snprintf(query,(size_t)cap,"replace into aux1 (mycall,dxcc,qso,qsl,time) values ");
-  if(n<0 || (unsigned long)n>=cap){free(query); return;}
-  p=query+n;
-  left=cap-(unsigned long)n;
-  first=1;
-  for(i=0;i<count;i++){
-    if(spot[i].dxcc_cache_fresh || !cluster_first_dxcc(spot,i))continue;
-    n=snprintf(p,(size_t)left,"%s('%s',%d,%ld,%ld,%lld)",first?"":",",esc_mycall,spot[i].dxcc,spot[i].dxcc_qso,spot[i].dxcc_qsl,now);
-    if(n<0 || (unsigned long)n>=left){free(query); return;}
-    p+=n; left-=(unsigned long)n; first=0;
-  }
-  if(!first)mysql_query(con,query);
+  qsoz_db_result_free(res);
   free(query);
 }
 
-static void cluster_call_stats(MYSQL *con,const char *esc_mycall,QsozClusterSpot *spot,int count) {
-  MYSQL_RES *res;
-  MYSQL_ROW row;
+static void cluster_call_stats(QsozDb *con,const char *esc_mycall,QsozClusterSpot *spot,int count) {
+  QsozResult *res;
+  QsozRow row;
   char *query,*p,esc[64];
   unsigned long cap,left;
   int i,n;
@@ -227,19 +195,19 @@ static void cluster_call_stats(MYSQL *con,const char *esc_mycall,QsozClusterSpot
   p=query+n;
   left=cap-(unsigned long)n;
   for(i=0;i<count;i++){
-    mysql_real_escape_string(con,esc,spot[i].dx,(unsigned long)strlen(spot[i].dx));
+    qsoz_db_escape_raw(esc,spot[i].dx,(unsigned long)strlen(spot[i].dx));
     n=sprintf(p,"%s'%s'",i==0?"":",",esc);
     if(n<0 || (unsigned long)n>=left){free(query); return;}
     p+=n; left-=(unsigned long)n;
   }
   if(left<=strlen(") group by callsign")){free(query); return;}
   strcpy(p,") group by callsign");
-  if(mysql_query(con,query)!=0){free(query); return;}
+  if(qsoz_db_query(con,query)!=0){free(query); return;}
   free(query);
-  res=mysql_store_result(con);
+  res=qsoz_db_result(con);
   if(res==NULL)return;
   for(;;){
-    row=mysql_fetch_row(res);
+    row=qsoz_db_fetch(res);
     if(row==NULL)break;
     for(i=0;i<count;i++)if(strcmp(spot[i].dx,row[0])==0){
       spot[i].call_qso=atol(row[1]);
@@ -247,7 +215,7 @@ static void cluster_call_stats(MYSQL *con,const char *esc_mycall,QsozClusterSpot
       spot[i].last=row[3]==NULL?0:atol(row[3]);
     }
   }
-  mysql_free_result(res);
+  qsoz_db_result_free(res);
 }
 
 static int parse_cluster_line(char *line,char **epoch,char **spotter,char **frequency,char **dx) {
@@ -274,18 +242,20 @@ static int parse_cluster_line(char *line,char **epoch,char **spotter,char **freq
 int qsoz_proc_main(void){
   int c,act,vv,gg,s,mypage,f1,line_rc;
   QsozConfig cfg;
-  char buf[8192],aux1[512],aux2[300],aux3[4096],aux4[512],aux5[300],aux6[300],aux7[300],aux8[300],aux9[4096],aux0[300],tok[13][100],mycall[16],cfgerr[256],callbook_response[256],cluster_line[1024],request_err[256],esc_mycall[64],esc_call[256],esc_contest[256],esc_cluster[256],esc_tx[256],esc_rx[256],html1[2048],html2[2048],html3[2048],html4[2048],js1[2048],*ff,*pp,*qq,*save1,*p1,*p2,*p3,*p4;
+  QsozUser user;
+  char buf[8192],aux1[512],aux2[300],aux3[4096],aux4[512],aux5[300],aux6[300],aux7[300],aux8[300],aux9[4096],aux0[300],tok[13][100],mycall[QSOZ_USER_CALL],cfgerr[256],callbook_response[256],cluster_line[1024],request_err[256],esc_mycall[64],esc_call[256],esc_contest[256],esc_cluster[256],esc_tx[256],esc_rx[256],html1[2048],html2[2048],html3[2048],html4[2048],js1[2048],*ff,*pp,*qq,*save1,*p1,*p2,*p3,*p4;
   struct tm ts,*tm_now;
   time_t epoch,td,open_epoch,close_epoch;
   long l1,l2,l3,l4,idx,suml[10],nnn,ppp,qqq;
   unsigned long lff;
   long long ll1,ll2,ll3;
-  MYSQL *con;
-  MYSQL_RES *res;
-  MYSQL_ROW row;
+  QsozDb *con;
+  QsozResult *res;
+  QsozRow row;
   FILE *fp;
   double fx,f6,f7,f8,dist,bear;
   RadioCty cty,cty2;
+  RadioWho who,who2;
   RadioAdif adif_rec;
   const char *adif_names[RADIO_ADIF_MAX_FIELDS],*adif_cursor;
   QsozLineReader cluster_reader;
@@ -304,22 +274,16 @@ int qsoz_proc_main(void){
     goto end_no_db;
   }
 
-  if(!qsoz_config_load(&cfg,QSOZ_CONFIG_FILE,cfgerr,sizeof(cfgerr))){fprintf(stderr,"pproc: %s\n",cfgerr); goto end_no_db;}
-  con=mysql_init(NULL);
-  if(con==NULL)goto end_no_db;
-  if(mysql_real_connect(con,cfg.db_host,cfg.db_user,cfg.db_pass,cfg.db_name,cfg.db_port,NULL,0)==NULL){fprintf(stderr,"pproc: mysql connect error: %s\n",mysql_error(con)); mysql_close(con); goto end_no_db;}
-  mysql_query(con,"SET time_zone='+00:00'");
-  sprintf(buf,"select mycall from user where ota='%s' and lastota+durationota>%ld limit 1",tok[0],time(NULL));
-  mysql_query(con,buf); res=mysql_store_result(con); row=mysql_fetch_row(res);
-  if(row==NULL){
+  if(!qsoz_user_session(tok[0],&user)){
     printf("Status: 200 OK\r\n");
     printf("Content-Type: text/html; charset=utf-8\r\n\r\n");
     printf("<pre><b>Login expired</b>\nPlease login again\n</pre>");
-    mysql_free_result(res);
-    goto end;
+    goto end_no_db;
   }
-  else strcpy(mycall,row[0]);
-  mysql_free_result(res);
+  strcpy(mycall,user.mycall);
+  if(!qsoz_config_load(&cfg,QSOZ_CONFIG_FILE,cfgerr,sizeof(cfgerr))){fprintf(stderr,"pproc: %s\n",cfgerr); goto end_no_db;}
+  con=qsoz_db_open();
+  if(con==NULL)goto end_no_db;
   if(!qsoz_db_escape(con,esc_mycall,sizeof(esc_mycall),mycall) ||
      !qsoz_db_escape(con,esc_call,sizeof(esc_call),tok[4]) ||
      !qsoz_db_escape(con,esc_contest,sizeof(esc_contest),tok[9]))goto end;
@@ -328,9 +292,9 @@ int qsoz_proc_main(void){
   if(act==5){ // Go button with date in call input and format YYYYMMDD
     printf("Content-Type: text/plain\r\n\r\n");
     sprintf(buf,"select count(*) from log where mycall='%s' and open>=%lld order by open",esc_mycall,(long long)qsoz_date_clock_epoch(tok[4],"00:00:00"));
-    mysql_query(con,buf); res=mysql_store_result(con); row=mysql_fetch_row(res);
+    qsoz_db_query(con,buf); res=qsoz_db_result(con); row=qsoz_db_fetch(res);
     l1=atol(row[0]);
-    mysql_free_result(res);
+    qsoz_db_result_free(res);
     printf("%ld\n",l1);
     goto end;
   }
@@ -343,10 +307,10 @@ int qsoz_proc_main(void){
     if(act<=5)sprintf(buf,"select open,close,callsign,freqtx,freqrx,mode,signaltx,signalrx,lotw,eqsl,qrz,contesttx,contestrx,contest from log where mycall='%s' order by open desc, callsign desc limit %d offset %ld",esc_mycall,mypage,atol(tok[2]));
     else if(act<=8)sprintf(buf,"select open,close,callsign,freqtx,freqrx,mode,signaltx,signalrx,lotw,eqsl,qrz,contesttx,contestrx,contest from log where callsign like '%s' and mycall='%s' order by open desc, callsign desc limit %d offset %ld",esc_call,esc_mycall,mypage,atol(tok[2]));
     else sprintf(buf,"select open,close,callsign,freqtx,freqrx,mode,signaltx,signalrx,lotw,eqsl,qrz,contesttx,contestrx,contest from log where contest='%s' and mycall='%s' order by open desc, callsign desc limit %d offset %ld",esc_contest,esc_mycall,mypage,atol(tok[2]));
-    mysql_query(con,buf);
-    res=mysql_store_result(con);
+    qsoz_db_query(con,buf);
+    res=qsoz_db_result(con);
     for(;;){
-      row=mysql_fetch_row(res);
+      row=qsoz_db_fetch(res);
       if(row==NULL)break;
       aux1[0]='\0';
       if(atoi(row[8])==1)strcat(aux1,"L");
@@ -373,7 +337,7 @@ int qsoz_proc_main(void){
       if(atol(row[4])>0&&atol(row[4])!=atol(row[3]))printf(" [%+.1f]",(atol(row[4])-atol(row[3]))/1000.0);
       printf("\n");
     }
-    mysql_free_result(res);
+    qsoz_db_result_free(res);
     printf("</pre>");
     goto end;
   }
@@ -384,19 +348,19 @@ int qsoz_proc_main(void){
     printf("<pre>");
     l1=l2=0;
     sprintf(buf,"select open,callsign from log where mycall='%s' and dxcc=0",esc_mycall);
-    mysql_query(con,buf);
-    res=mysql_store_result(con);
+    qsoz_db_query(con,buf);
+    res=qsoz_db_result(con);
     for(;;){
-      row=mysql_fetch_row(res);
+      row=qsoz_db_fetch(res);
       if(row==NULL)break;
-      if(radio_cty_lookup(con,row[1],&cty)==1 && qsoz_db_escape(con,esc_cluster,sizeof(esc_cluster),row[1])){
+      if(radio_cty_lookup(row[1],&cty)==1 && qsoz_db_escape(con,esc_cluster,sizeof(esc_cluster),row[1])){
         sprintf(aux1,"Update log set dxcc=%d where mycall='%s' and open=%lld and callsign='%s' and dxcc=0",atoi(cty.dxcc),esc_mycall,atoll(row[0]),esc_cluster);
-        mysql_query(con,aux1);
+        qsoz_db_query(con,aux1);
         l1++;
       }
       else l2++;
     }
-    mysql_free_result(res);
+    qsoz_db_result_free(res);
     printf("Set dxcc: %ld\nNot found dxcc: %ld\n",l1,l2);
     printf("</pre>");
     goto end;
@@ -408,10 +372,10 @@ int qsoz_proc_main(void){
     printf("<pre>");
     qsoz_stats_reset();
     sprintf(buf,"select callsign,freqtx,mode,lotw,eqsl,qrz,dxcc from log where mycall='%s'",esc_mycall);
-    mysql_query(con,buf);
-    res=mysql_use_result(con);
+    qsoz_db_query(con,buf);
+    res=qsoz_db_result(con);
     for(;;){
-      row=mysql_fetch_row(res);
+      row=qsoz_db_fetch(res);
       if(row==NULL)break;
       c=(int)(atol(row[1])/1000000.0);
       if(c>433)continue;
@@ -433,7 +397,7 @@ int qsoz_proc_main(void){
       if(atoi(row[4])==1)incdata3(0,6,aux1,1,1);
       if(atoi(row[5])==1)incdata3(0,7,aux1,1,1);
     }
-    mysql_free_result(res);
+    qsoz_db_result_free(res);
     qsoz_stats_sort_bucket(0,0);
     qsoz_stats_sort_bucket(0,4);
 
@@ -447,10 +411,7 @@ int qsoz_proc_main(void){
     printf("<p class=\"myh2\">%6s %7ld %8s %8s %8ld %8ld %8ld</p>","Tot",ndata3[0][4],"","",ndata3[0][5],ndata3[0][6],ndata3[0][7]);
     for(l1=0;l1<ndata3[0][4];l1++){
       printf("%6s %7ld %8ld %8ld %8ld %8ld %8ld",data3[0][4][l1].lab,data3[0][4][l1].num,ndata3[2][data3[0][4][l1].idx],ndata3[4][data3[0][4][l1].idx],numdata3(0,5,data3[0][4][l1].lab),numdata3(0,6,data3[0][4][l1].lab),numdata3(0,7,data3[0][4][l1].lab));
-      sprintf(buf,"select name from cty where dxcc='%d' limit 1",atoi(data3[0][4][l1].lab));
-      mysql_query(con,buf); res=mysql_store_result(con); row=mysql_fetch_row(res);
-      if(row!=NULL){if(!qsoz_html_text(html1,sizeof(html1),row[0]))html1[0]='\0'; printf(" %s",html1);}
-      mysql_free_result(res);
+      if(radio_cty_name(atoi(data3[0][4][l1].lab),aux1,sizeof(aux1))==1){if(!qsoz_html_text(html1,sizeof(html1),aux1))html1[0]='\0'; printf(" %s",html1);}
       printf("\n");
     }
     printf("</pre>");
@@ -462,10 +423,10 @@ int qsoz_proc_main(void){
     printf("Content-Type: text/html; charset=utf-8\r\n\r\n<!--%d-->",act);
     qsoz_stats_reset();
     sprintf(buf,"select callsign,freqtx,mode,lotw,eqsl,qrz,dxcc from log where mycall='%s'",esc_mycall);
-    mysql_query(con,buf);
-    res=mysql_use_result(con);
+    qsoz_db_query(con,buf);
+    res=qsoz_db_result(con);
     for(;;){
-      row=mysql_fetch_row(res);
+      row=qsoz_db_fetch(res);
       if(row==NULL)break;
       c=(int)(atol(row[1])/1000000.0);
       if(c>433)continue;
@@ -477,7 +438,7 @@ int qsoz_proc_main(void){
       if(atoi(row[4])==1)incdata3(0,4,row[0],1,1);
       if(atoi(row[5])==1)incdata3(0,5,row[0],1,1);
     }
-    mysql_free_result(res);
+    qsoz_db_result_free(res);
     printf("<table>");
     for(c=0;c<6;c++){
       qsoz_stats_sort_bucket(0,c);
@@ -503,10 +464,10 @@ int qsoz_proc_main(void){
     strftime(aux5,sizeof(aux5),"%Y-%m-%d",&ts);
     strftime(aux6,sizeof(aux6),"%Y-%m-%d",tm_now);
     sprintf(buf,"select callsign,open,mode,lotw,eqsl,qrz,dxcc from log where mycall='%s'",esc_mycall);
-    mysql_query(con,buf);
-    res=mysql_use_result(con);
+    qsoz_db_query(con,buf);
+    res=qsoz_db_result(con);
     for(;;){
-      row=mysql_fetch_row(res);
+      row=qsoz_db_fetch(res);
       if(row==NULL)break;
       strcpy(aux2,qsoz_mode(row[2]));
       sprintf(aux1,"%.4s",qsoz_epoch_text(atoll(row[1])));
@@ -547,7 +508,7 @@ int qsoz_proc_main(void){
         if(strcmp(aux2,"PH")==0)incdata3(0,6,aux1,1,1);
       } 
     }
-    mysql_free_result(res);
+    qsoz_db_result_free(res);
     qsoz_stats_sort_bucket(0,0);
 
     suml[0]=4; suml[1]=7; suml[2]=10;
@@ -580,16 +541,16 @@ int qsoz_proc_main(void){
       if(adif_rec.value[3][0]!='\0'){
         if(epoch==(time_t)-1 || !qsoz_db_escape(con,esc_call,sizeof(esc_call),adif_rec.value[0])){ppp++; qqq++; gg=radio_adif_extract(&adif_cursor,adif_names,vv,&adif_rec); continue;}
         snprintf(buf,sizeof(buf),"select %s from log where mycall='%s' and callsign='%s' and open>=%lld and open<=%lld",aux4,esc_mycall,esc_call,(long long)(epoch-QSLWIN),(long long)(epoch+QSLWIN));
-        mysql_query(con,buf); 
-        res=mysql_store_result(con); 
-        row=mysql_fetch_row(res); 
+        qsoz_db_query(con,buf); 
+        res=qsoz_db_result(con); 
+        row=qsoz_db_fetch(res); 
         if(row==NULL)c=-1; else c=atoi(row[0]); 
-        mysql_free_result(res);
+        qsoz_db_result_free(res);
         ppp++;
         if(c==-1)qqq++;
         if(c==0){
           snprintf(buf,sizeof(buf),"update log set %s=1 where mycall='%s' and callsign='%s' and open>=%lld and open<=%lld",aux4,esc_mycall,esc_call,(long long)(epoch-QSLWIN),(long long)(epoch+QSLWIN));
-          mysql_query(con,buf);
+          qsoz_db_query(con,buf);
           nnn++;
         }
       }
@@ -613,7 +574,7 @@ int qsoz_proc_main(void){
       if(adif_rec.value[14][0]=='\0')strcpy(adif_rec.value[14],adif_rec.value[13]);
       if(adif_rec.value[7][0]=='\0')strcpy(adif_rec.value[7],adif_rec.value[6]);
       if(adif_rec.value[7][4]=='\0'){adif_rec.value[7][4]='0'; adif_rec.value[7][5]='0'; adif_rec.value[7][6]='\0';}
-      if(radio_cty_lookup(con,adif_rec.value[0],&cty)!=1)cty.dxcc[0]='\0';
+      if(radio_cty_lookup(adif_rec.value[0],&cty)!=1)cty.dxcc[0]='\0';
       open_epoch=radio_adif_time(adif_rec.value[13],adif_rec.value[6]);
       close_epoch=radio_adif_time(adif_rec.value[14],adif_rec.value[7]);
       if(open_epoch==(time_t)-1 || close_epoch==(time_t)-1){ppp++; gg=radio_adif_extract(&adif_cursor,adif_names,vv,&adif_rec); continue;}
@@ -625,9 +586,9 @@ int qsoz_proc_main(void){
                              atoi(cty.dxcc),(long long)open_epoch,(long long)close_epoch)){
         ppp++; gg=radio_adif_extract(&adif_cursor,adif_names,vv,&adif_rec); continue;
       }
-      snprintf(buf,sizeof(buf),"insert ignore into log (mycall,callsign,mode,freqtx,freqrx,signaltx,signalrx,contesttx,contestrx,contest,dxcc,open,close) value %s",aux3);
-      mysql_query(con,buf);
-      l1=mysql_affected_rows(con);
+      snprintf(buf,sizeof(buf),"insert or ignore into log (mycall,callsign,mode,freqtx,freqrx,signaltx,signalrx,contesttx,contestrx,contest,dxcc,open,close) values %s",aux3);
+      qsoz_db_query(con,buf);
+      l1=qsoz_db_changes(con);
       if(l1>0){nnn+=l1; printf("%s\n",aux3);}
       ppp++;
       gg=radio_adif_extract(&adif_cursor,adif_names,vv,&adif_rec);
@@ -654,10 +615,10 @@ int qsoz_proc_main(void){
        if(!qsoz_db_escape(con,esc_contest,sizeof(esc_contest),adif_rec.value[2]))goto end;
        snprintf(buf,sizeof(buf),"select open,callsign,freqtx,mode,signaltx,signalrx,close,freqrx,contesttx,contestrx,contest from log where mycall='%s' and contest='%s' order by open",esc_mycall,esc_contest);
      }
-     mysql_query(con,buf);
-     res=mysql_store_result(con);
+     qsoz_db_query(con,buf);
+     res=qsoz_db_result(con);
      for(l1=0;;l1++){
-       row=mysql_fetch_row(res);
+       row=qsoz_db_fetch(res);
        if(row==NULL)break;
        fprintf(fp,"<CALL:%lu>%s\n",(unsigned long)strlen(row[1]),row[1]);
        p1=qsoz_epoch_text(atoll(row[0]));
@@ -676,7 +637,7 @@ int qsoz_proc_main(void){
        fprintf(fp,"<CONTEST_ID:%lu>%s\n",(unsigned long)strlen(row[10]),row[10]);
        fprintf(fp,"<EOR>\n\n");
      }
-     res=mysql_store_result(con);
+     res=qsoz_db_result(con);
      fclose(fp);
      printf("<pre>");
      printf("<pre><a href='/files/%s' download>Download ADIF</a>\n",aux1);
@@ -699,32 +660,31 @@ int qsoz_proc_main(void){
     fprintf(fp,"-OF-LOG: 3.0\nCREATED-BY: IK4LZH logger\n");
     fprintf(fp,"CONTEST: xxxxxx\nCALLSIGN: %s\nOPERATORS: %s\n",mycall,mycall);
     fprintf(fp,"CATEGORY-OPERATOR: SINGLE-OP\nCATEGORY-ASSISTED: ASSISTED\nCATEGORY-BAND: ALL\nCATEGORY-POWER: LOW\nCATEGORY-TRANSMITTER: ONE\n");    
-    sprintf(buf,"select firstname,lastname,addr1,addr2,state,zip,country,email from who where callsign='%s'",esc_mycall);
-    mysql_query(con,buf); res=mysql_store_result(con); row=mysql_fetch_row(res);
-    fprintf(fp,"NAME: %s %s\n",row[0],row[1]);
-    if(row[7][0]!='\0')fprintf(fp,"EMAIL: %s\n",row[7]);
-    if(row[2][0]!='\0')fprintf(fp,"ADDRESS: %s\n",row[2]);
-    if(row[3][0]!='\0')fprintf(fp,"ADDRESS-CITY: %s\n",row[3]);
-    if(row[4][0]!='\0')fprintf(fp,"ADDRESS-STATE-PROVINCE: %s\n",row[4]);
-    if(row[5][0]!='\0')fprintf(fp,"ADDRESS-POSTALCODE: %s\n",row[5]);
-    if(row[6][0]!='\0')fprintf(fp,"ADDRESS-COUNTRY: %s\n",row[6]);
+    memset(&who,0,sizeof(who));
+    radio_who_lookup(mycall,&who);
+    fprintf(fp,"NAME: %s %s\n",who.firstname,who.lastname);
+    if(who.email[0]!='\0')fprintf(fp,"EMAIL: %s\n",who.email);
+    if(who.addr1[0]!='\0')fprintf(fp,"ADDRESS: %s\n",who.addr1);
+    if(who.addr2[0]!='\0')fprintf(fp,"ADDRESS-CITY: %s\n",who.addr2);
+    if(who.state[0]!='\0')fprintf(fp,"ADDRESS-STATE-PROVINCE: %s\n",who.state);
+    if(who.zip[0]!='\0')fprintf(fp,"ADDRESS-POSTALCODE: %s\n",who.zip);
+    if(who.country[0]!='\0')fprintf(fp,"ADDRESS-COUNTRY: %s\n",who.country);
     fprintf(fp,"CLUB: Italian Contest Club\n");
-    mysql_free_result(res);
     if(adif_rec.value[2][0]=='\0')snprintf(buf,sizeof(buf),"select open,callsign,freqtx,mode,signaltx,signalrx,contesttx,contestrx from log where mycall='%s' and open>=%lld and open<=%lld order by open",esc_mycall,(long long)qsoz_datetime_epoch(adif_rec.value[0]),(long long)qsoz_datetime_epoch(adif_rec.value[1]));
     else {
       if(!qsoz_db_escape(con,esc_contest,sizeof(esc_contest),adif_rec.value[2]))goto end;
       snprintf(buf,sizeof(buf),"select open,callsign,freqtx,mode,signaltx,signalrx,contesttx,contestrx from log where mycall='%s' and contest='%s' order by open",esc_mycall,esc_contest);
     }
-    mysql_query(con,buf);
-    res=mysql_store_result(con);
+    qsoz_db_query(con,buf);
+    res=qsoz_db_result(con);
     for(l1=0;;l1++){
-      row=mysql_fetch_row(res);
+      row=qsoz_db_fetch(res);
       if(row==NULL)break;
       p1=qsoz_epoch_text(atoll(row[0]));
       fprintf(fp,"QSO: %5ld %2s %.4s-%.2s-%.2s %.2s%.2s",atol(row[2])/1000L,qsoz_mode(row[3]),p1,p1+5,p1+8,p1+11,p1+14);
       fprintf(fp," %-13s %3s %-6s %-13s %3s %-6s 0\n",mycall,row[4],row[6],row[1],row[5],row[7]);
     }
-    res=mysql_store_result(con);
+    res=qsoz_db_result(con);
     fprintf(fp,"END-OF-LOG:\n");
     fclose(fp);
     printf("<pre>");
@@ -749,7 +709,7 @@ int qsoz_proc_main(void){
       else if(pp[0]!='\0' && pp[0]!=' ' && aux1[0]!='\0' && aux2[0]!='\0' && aux3[0]!='\0'){
         if(!parse_lzh_qso(pp,aux5,sizeof(aux5),aux6,sizeof(aux6),aux7,sizeof(aux7),aux8,sizeof(aux8))){pp=strtok(NULL,"\n"); continue;}
         for(qq=aux6;*qq!='\0';qq++)*qq=(char)toupper((unsigned char)*qq);
-        if(radio_cty_lookup(con,aux6,&cty)!=1)cty.dxcc[0]='\0';
+        if(radio_cty_lookup(aux6,&cty)!=1)cty.dxcc[0]='\0';
         strcat(aux5,":00");
         epoch=qsoz_date_clock_epoch(aux1,aux5);
         if(epoch==(time_t)-1){ppp++; pp=strtok(NULL,"\n"); continue;}
@@ -757,9 +717,9 @@ int qsoz_proc_main(void){
                                aux7,aux8,"","","",atoi(cty.dxcc),(long long)epoch,(long long)epoch)){
           ppp++; pp=strtok(NULL,"\n"); continue;
         }
-        snprintf(buf,sizeof(buf),"insert ignore into log (mycall,callsign,mode,freqtx,freqrx,signaltx,signalrx,contesttx,contestrx,contest,dxcc,open,close) value %s",aux9);
-        mysql_query(con,buf);
-        l1=mysql_affected_rows(con);
+        snprintf(buf,sizeof(buf),"insert or ignore into log (mycall,callsign,mode,freqtx,freqrx,signaltx,signalrx,contesttx,contestrx,contest,dxcc,open,close) values %s",aux9);
+        qsoz_db_query(con,buf);
+        l1=qsoz_db_changes(con);
         if(l1>0){nnn+=l1; printf("%s\n",aux9);}
         ppp++;
       }
@@ -786,19 +746,19 @@ int qsoz_proc_main(void){
         }
         if(strlen(aux4)+3>=sizeof(aux4)){pp=strtok_r(NULL,"\n",&save1); continue;}
         strcat(aux4,":00");
-        if(radio_cty_lookup(con,aux7,&cty)!=1)cty.dxcc[0]='\0';
+        if(radio_cty_lookup(aux7,&cty)!=1)cty.dxcc[0]='\0';
         epoch=qsoz_date_clock_epoch(aux3,aux4);
         if(epoch==(time_t)-1){ppp++; pp=strtok_r(NULL,"\n",&save1); continue;}
         l1=atol(aux1)*1000L;
         if(!qsoz_db_escape(con,esc_call,sizeof(esc_call),aux7)) {ppp++; pp=strtok_r(NULL,"\n",&save1); continue;}
         snprintf(buf,sizeof(buf),"select count(*),open from log where mycall='%s' and callsign='%s' and open>=%lld and open<=%lld and freqtx>=%ld and freqtx<=%ld limit 1",esc_mycall,esc_call,(long long)(epoch-180),(long long)(epoch+180),l1-1700000,l1+1700000);
-        mysql_query(con,buf); res=mysql_store_result(con); row=mysql_fetch_row(res); gg=atoi(row[0]); if(gg>0)epoch=atoll(row[1]);
-        mysql_free_result(res);
+        qsoz_db_query(con,buf); res=qsoz_db_result(con); row=qsoz_db_fetch(res); gg=atoi(row[0]); if(gg>0)epoch=atoll(row[1]);
+        qsoz_db_result_free(res);
         if(gg==0){
           if(!qsoz_db_log_values(con,aux3,sizeof(aux3),mycall,aux7,aux2,l1,l1,aux5,aux8,aux6,aux9,aux0,atoi(cty.dxcc),(long long)epoch,(long long)epoch)){
             ppp++; pp=strtok_r(NULL,"\n",&save1); continue;
           }
-          snprintf(buf,sizeof(buf),"insert into log (mycall,callsign,mode,freqtx,freqrx,signaltx,signalrx,contesttx,contestrx,contest,dxcc,open,close) value %s",aux3);
+          snprintf(buf,sizeof(buf),"insert into log (mycall,callsign,mode,freqtx,freqrx,signaltx,signalrx,contesttx,contestrx,contest,dxcc,open,close) values %s",aux3);
           nnn++;
         }
         else {
@@ -807,7 +767,7 @@ int qsoz_proc_main(void){
           }
           snprintf(buf,sizeof(buf),"update log set contesttx='%s',contestrx='%s',contest='%s' where mycall='%s' and callsign='%s' and open=%lld",esc_tx,esc_rx,esc_contest,esc_mycall,esc_call,(long long)epoch);
         }
-        mysql_query(con,buf);
+        qsoz_db_query(con,buf);
         ppp++;
       }
       pp=strtok_r(NULL,"\n",&save1);
@@ -825,24 +785,25 @@ int qsoz_proc_main(void){
     epoch=time(NULL); 
     printf("Start: %s\n",qsoz_epoch_text(epoch));
     printf("<table><td>");
-    if(radio_cty_lookup(con,tok[4],&cty)==1){
+    if(radio_cty_lookup(tok[4],&cty)==1){
       vv=atoi(cty.dxcc); f6=atof(cty.latitude); f7=atof(cty.longitude); f8=atof(cty.gmtshift);
       qsoz_html_text(html1,sizeof(html1),cty.base); qsoz_html_text(html2,sizeof(html2),cty.name);
       printf("<pre>base:%s\nname:%s\ndxcc:%s\ncont:%s\ncqzone:%s\nituzone:%s\nlatitude:%s\nlongitude:%s\ngmtshift:%s\n</pre>",html1,html2,cty.dxcc,cty.cont,cty.cqzone,cty.ituzone,cty.latitude,cty.longitude,cty.gmtshift);
     } else {vv=0; f6=f7=f8=0.0;}
     printf("</td><td>");
-    if(radio_cty_lookup(con,mycall,&cty2)==1){
+    if(radio_cty_lookup(mycall,&cty2)==1){
       dist=radio_distance_km(f6,f7,atof(cty2.latitude),atof(cty2.longitude));
       bear=radio_bearing_deg(f6,f7,atof(cty2.latitude),atof(cty2.longitude));
       printf("<pre>distance:%5.0f\nbearing:%5.0f\ndeltatime:%.0f\n</pre>",dist,bear,atof(cty2.gmtshift)-f8);
     }
     printf("</td><td>");    
-    sprintf(buf,"select grid from who where callsign='%s'",esc_call);
-    mysql_query(con,buf); res=mysql_store_result(con); row=mysql_fetch_row(res); if(row!=NULL)strcpy(aux1,row[0]); else aux1[0]='\0';
-    mysql_free_result(res);
-    sprintf(buf,"select grid from who where callsign='%s'",esc_mycall);
-    mysql_query(con,buf); res=mysql_store_result(con); row=mysql_fetch_row(res); if(row!=NULL)strcpy(aux2,row[0]); else aux2[0]='\0';
-    mysql_free_result(res);
+    c=radio_who_lookup(tok[4],&who);
+    if(c==0){
+      radio_callbook_lookup(cfg.callbook_host,cfg.callbook_port,RADIO_CALLBOOK_QRZCOM,tok[4],cfg.callbook_timeout,callbook_response,sizeof(callbook_response));
+      c=radio_who_lookup(tok[4],&who);
+    }
+    if(radio_who_lookup(mycall,&who2)==1)strcpy(aux2,who2.grid); else aux2[0]='\0';
+    if(c==1)strcpy(aux1,who.grid); else aux1[0]='\0';
     if(aux1[0]!='\0' && aux2[0]!='\0' && radio_locator_distance_bearing(aux1,aux2,&dist,&bear)){
       if(!qsoz_html_text(html1,sizeof(html1),aux1))html1[0]='\0';
       if(!qsoz_html_text(html2,sizeof(html2),aux2))html2[0]='\0';
@@ -850,36 +811,28 @@ int qsoz_proc_main(void){
     }
     printf("</td></table>");
     sprintf(buf,"select count(*) from log where mycall='%s' and dxcc=%d",esc_mycall,vv);
-    mysql_query(con,buf); res=mysql_store_result(con); row=mysql_fetch_row(res); l1=atol(row[0]);
-    mysql_free_result(res);
+    qsoz_db_query(con,buf); res=qsoz_db_result(con); row=qsoz_db_fetch(res); l1=atol(row[0]);
+    qsoz_db_result_free(res);
     printf("<pre>Records with same dxcc[%d]: %ld\n</pre>",vv,l1);
     qsoz_stats_reset();
-    sprintf(buf,"select count(*) from who where callsign='%s'",esc_call);
-    mysql_query(con,buf); res=mysql_store_result(con); row=mysql_fetch_row(res); c=atoi(row[0]);
-    mysql_free_result(res);
-    if(c==0)radio_callbook_lookup(cfg.callbook_host,cfg.callbook_port,RADIO_CALLBOOK_QRZCOM,tok[4],cfg.callbook_timeout,callbook_response,sizeof(callbook_response));
-    sprintf(buf,"select firstname,lastname,addr1,addr2,state,zip,country,grid,email,cqzone,ituzone,born,src,image,time from who where callsign='%s'",esc_call);
-    mysql_query(con,buf); res=mysql_store_result(con); row=mysql_fetch_row(res);
-    if(row!=NULL){
+    if(c==1){
       printf("<table><td><pre>");
-      qsoz_html_text(html1,sizeof(html1),row[0]); qsoz_html_text(html2,sizeof(html2),row[1]); printf("%s %s\n",html1,html2);
-      qsoz_html_text(html1,sizeof(html1),row[2]); qsoz_html_text(html2,sizeof(html2),row[3]); printf("%s\n%s\n",html1,html2);
-      qsoz_html_text(html1,sizeof(html1),row[4]); qsoz_html_text(html2,sizeof(html2),row[5]); qsoz_html_text(html3,sizeof(html3),row[6]); printf("%s %s %s\n",html1,html2,html3);
-      qsoz_html_text(html1,sizeof(html1),row[7]); qsoz_html_text(html2,sizeof(html2),row[8]); printf("%s\n%s\n",html1,html2);
-      qsoz_html_text(html1,sizeof(html1),row[9]); qsoz_html_text(html2,sizeof(html2),row[10]); qsoz_html_text(html3,sizeof(html3),row[11]); qsoz_html_text(html4,sizeof(html4),row[12]); printf("%s %s %s %s\n",html1,html2,html3,html4);
-    //  printf("%s\n",qsoz_epoch_text(atoll(row[14])));
+      qsoz_html_text(html1,sizeof(html1),who.firstname); qsoz_html_text(html2,sizeof(html2),who.lastname); printf("%s %s\n",html1,html2);
+      qsoz_html_text(html1,sizeof(html1),who.addr1); qsoz_html_text(html2,sizeof(html2),who.addr2); printf("%s\n%s\n",html1,html2);
+      qsoz_html_text(html1,sizeof(html1),who.state); qsoz_html_text(html2,sizeof(html2),who.zip); qsoz_html_text(html3,sizeof(html3),who.country); printf("%s %s %s\n",html1,html2,html3);
+      qsoz_html_text(html1,sizeof(html1),who.grid); qsoz_html_text(html2,sizeof(html2),who.email); printf("%s\n%s\n",html1,html2);
+      printf("%d %d %d ",who.cqzone,who.ituzone,who.born); qsoz_html_text(html4,sizeof(html4),who.src); printf("%s\n",html4);
       printf("</pre></td>");
-      if(row[13][0]!='\0' && qsoz_html_attr(html1,sizeof(html1),row[13]))printf("<td><img src=\"%s\" width=\"200\" style=\"cursor:zoom-in\" onclick=\"openImgExact(this.src)\"></td>",html1);
+      if(who.image[0]!='\0' && qsoz_html_attr(html1,sizeof(html1),who.image))printf("<td><img src=\"%s\" width=\"200\" style=\"cursor:zoom-in\" onclick=\"openImgExact(this.src)\"></td>",html1);
       printf("</table>\n");
     }
-    mysql_free_result(res);
     printf("<pre>");
     sprintf(buf,"select open,close,callsign,freqtx,freqrx,mode,signaltx,signalrx,lotw,eqsl,qrz,contesttx,contestrx,contest from log where callsign='%s' and mycall='%s' order by open desc",esc_call,esc_mycall);
-    mysql_query(con,buf);
-    res=mysql_store_result(con);
+    qsoz_db_query(con,buf);
+    res=qsoz_db_result(con);
     vv=0;
     for(;;){
-      row=mysql_fetch_row(res);
+      row=qsoz_db_fetch(res);
       if(row==NULL)break;
       c=(int)(atol(row[3])/1000000.0);
       if(c>433)continue;
@@ -912,7 +865,7 @@ int qsoz_proc_main(void){
         printf("\n");
       }
     }
-    mysql_free_result(res);
+    qsoz_db_result_free(res);
     qsoz_stats_sort_bucket(0,0);
 
     printf("<p class=\"myh1\">%6s %8s %8s %8s %8s</p>","B/Mode","QSO","QSL.LOTW","QSL.EQSL","QSL.QRZ");
@@ -938,12 +891,12 @@ int qsoz_proc_main(void){
     if(tok[9][0]=='-')tok[9][0]='\0';
     if(tok[10][0]=='-')tok[10][0]='\0';
     if(tok[11][0]=='-')tok[11][0]='\0';
-    if(radio_cty_lookup(con,tok[4],&cty)!=1)cty.dxcc[0]='\0';
+    if(radio_cty_lookup(tok[4],&cty)!=1)cty.dxcc[0]='\0';
     open_epoch=qsoz_datetime_epoch(tok[12]);
     if(open_epoch==(time_t)-1)goto end;
     if(!qsoz_db_log_values(con,aux3,sizeof(aux3),mycall,tok[4],tok[6],l1,l1,tok[7],tok[8],tok[10],tok[11],tok[9],atoi(cty.dxcc),(long long)open_epoch,(long long)time(NULL)))goto end;
-    snprintf(buf,sizeof(buf),"insert into log (mycall,callsign,mode,freqtx,freqrx,signaltx,signalrx,contesttx,contestrx,contest,dxcc,open,close) value %s",aux3);
-    if(mysql_query(con,buf)==0)printf("%s inserted\n",tok[4]);
+    snprintf(buf,sizeof(buf),"insert into log (mycall,callsign,mode,freqtx,freqrx,signaltx,signalrx,contesttx,contestrx,contest,dxcc,open,close) values %s",aux3);
+    if(qsoz_db_query(con,buf)==0)printf("%s inserted\n",tok[4]);
     goto end;
   }
 
@@ -954,7 +907,7 @@ int qsoz_proc_main(void){
     callbook_response[0]='\0';
     radio_callbook_lookup(cfg.callbook_host,cfg.callbook_port,RADIO_CALLBOOK_QRZCOM,tok[4],cfg.callbook_timeout,callbook_response,sizeof(callbook_response));
     if(callbook_response[0]=='\0')strcpy(callbook_response,"ERROR callbook service unavailable\n");
-    print_callbook_result(con,esc_call,callbook_response);
+    print_callbook_result(tok[4],callbook_response);
     goto end;
   }
 
@@ -965,7 +918,7 @@ int qsoz_proc_main(void){
     callbook_response[0]='\0';
     radio_callbook_lookup(cfg.callbook_host,cfg.callbook_port,RADIO_CALLBOOK_QRZRU,tok[4],cfg.callbook_timeout,callbook_response,sizeof(callbook_response));
     if(callbook_response[0]=='\0')strcpy(callbook_response,"ERROR callbook service unavailable\n");
-    print_callbook_result(con,esc_call,callbook_response);
+    print_callbook_result(tok[4],callbook_response);
     goto end;
   }
 
@@ -974,10 +927,10 @@ int qsoz_proc_main(void){
     printf("Content-Type: text/html; charset=utf-8\r\n\r\n<!--%d-->",act);
     printf("<pre>");
     sprintf(buf,"select contest,min(open),max(open),count(callsign) from log where mycall='%s' and contest<>'' group by contest order by max(open) desc",esc_mycall);
-    mysql_query(con,buf);
-    res=mysql_store_result(con);
+    qsoz_db_query(con,buf);
+    res=qsoz_db_result(con);
     for(;;){
-      row=mysql_fetch_row(res);
+      row=qsoz_db_fetch(res);
       if(row==NULL)break;
       aux1[0]='\0';
       if(conscore_supported(row[0]))strcpy(aux1,"Scorable");
@@ -987,7 +940,7 @@ int qsoz_proc_main(void){
       printf("%s -> ",qsoz_epoch_text(atoll(row[1])));
       printf("%s %s\n",qsoz_epoch_text(atoll(row[2])),aux1);
     }
-    mysql_free_result(res);
+    qsoz_db_result_free(res);
     printf("</pre>");
     goto end;
   }
@@ -995,16 +948,16 @@ int qsoz_proc_main(void){
   if(act==31){ // contest details button
     printf("Status: 200 OK\r\n");
     printf("Content-Type: text/html; charset=utf-8\r\n\r\n<!--%d-->",act);
-    conscore_setup(con,tok,mycall);
+    conscore_setup(tok,mycall);
     sprintf(buf,"select min(open),max(open) from log where mycall='%s' and contest='%s'",esc_mycall,esc_contest);
-    mysql_query(con,buf); res=mysql_store_result(con); row=mysql_fetch_row(res);
+    qsoz_db_query(con,buf); res=qsoz_db_result(con); row=qsoz_db_fetch(res);
     if(row==NULL || row[0]==NULL || row[1]==NULL){
-      if(res!=NULL)mysql_free_result(res);
+      if(res!=NULL)qsoz_db_result_free(res);
       printf("<pre>No QSO for selected contest</pre>");
       goto end;
     }
     ll1=atoll(row[0]); ll2=atoll(row[1]);
-    mysql_free_result(res);
+    qsoz_db_result_free(res);
     conscore(con,tok,mycall,ll1,ll2);
     qsoz_stats_sort_bucket(0,0);
     qsoz_stats_sort_bucket(0,1);
@@ -1042,16 +995,16 @@ int qsoz_proc_main(void){
   if(act==14){ // contest graph button
     printf("Status: 200 OK\r\n");
     printf("Content-Type: text/html; charset=utf-8\r\n\r\n<!--%d-->",act);
-    conscore_setup(con,tok,mycall);
+    conscore_setup(tok,mycall);
     sprintf(buf,"select min(open),max(open) from log where mycall='%s' and contest='%s'",esc_mycall,esc_contest);
-    mysql_query(con,buf); res=mysql_store_result(con); row=mysql_fetch_row(res);
+    qsoz_db_query(con,buf); res=qsoz_db_result(con); row=qsoz_db_fetch(res);
     if(row==NULL || row[0]==NULL || row[1]==NULL){
-      if(res!=NULL)mysql_free_result(res);
+      if(res!=NULL)qsoz_db_result_free(res);
       printf("<pre>No QSO for selected contest</pre>");
       goto end;
     }
     ll1=atoll(row[0]); ll2=atoll(row[1]);
-    mysql_free_result(res);
+    qsoz_db_result_free(res);
     printf("<div class=\"gchart\" data-rows='[ ");
     for(ll3=ll1;ll3<=ll2;ll3+=900){
       conscore(con,tok,mycall,ll3,ll3+899);
@@ -1092,13 +1045,13 @@ int qsoz_proc_main(void){
       spot[count].epoch=atoll(p1);
       spot[count].freq=atol(p3);
       if(!qsoz_copy(spot[count].spotter,sizeof(spot[count].spotter),p2) || !qsoz_copy(spot[count].dx,sizeof(spot[count].dx),p4))continue;
-      if(radio_cty_lookup(con,spot[count].dx,&cty)==1)spot[count].dxcc=atoi(cty.dxcc);
+      if(radio_cty_lookup(spot[count].dx,&cty)==1)spot[count].dxcc=atoi(cty.dxcc);
       count++;
     }
     if(line_rc<0)fprintf(stderr,"pproc: cluster stream error\n");
     close(s);
 
-    cluster_dxcc_stats(con,esc_mycall,spot,count);
+    cluster_dxcc_stats(con,mycall,esc_mycall,spot,count);
     cluster_call_stats(con,esc_mycall,spot,count);
 
     for(i=0;i<count;i++){
@@ -1121,7 +1074,7 @@ int qsoz_proc_main(void){
   end:
   free(ff);
   qsoz_stats_free();
-  mysql_close(con);
+  qsoz_db_close(con);
   return 0;
 
   end_no_db:

@@ -1,10 +1,11 @@
-// Gianluca Mazzini @2022- Version 4.3
+// Gianluca Mazzini @2022- Version 4.12
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
 #include <unistd.h>
-#include <mysql/mysql.h>
+#include "qsoz_db.h"
+#include <sqlite3.h>
 #include "qsoz_contest.h"
 #include "qsoz_stats.h"
 #include "qsoz_time.h"
@@ -56,33 +57,39 @@ static void contest_time_key(long long epoch,char *out,unsigned long cap) {
   strftime(out,(size_t)cap,"%Y-%m-%d:%H%M",t);
 }
 
-static int contest_load_continents(MYSQL *con,char cont[][3],unsigned char ambiguous[]) {
-  MYSQL_RES *res;
-  MYSQL_ROW row;
-  int dxcc;
+static int contest_load_continents(char cont[][3],unsigned char ambiguous[]) {
+  sqlite3 *db;
+  sqlite3_stmt *stmt;
+  const unsigned char *text;
+  int dxcc,rc,ok;
 
   memset(cont,0,CONTEST_DXCC_MAX*3UL);
   memset(ambiguous,0,CONTEST_DXCC_MAX*sizeof(unsigned char));
-  if(mysql_query(con,"select dxcc,min(cont),count(distinct cont) from cty group by dxcc")!=0)return 0;
-  res=mysql_store_result(con);
-  if(res==NULL)return 0;
+  db=NULL;
+  if(sqlite3_open_v2(RADIO_CTY_DB,&db,SQLITE_OPEN_READONLY,NULL)!=SQLITE_OK){if(db!=NULL)sqlite3_close(db); return 0;}
+  stmt=NULL;
+  if(sqlite3_prepare_v2(db,"select dxcc,min(cont),count(distinct cont) from cty group by dxcc",-1,&stmt,NULL)!=SQLITE_OK){sqlite3_close(db); return 0;}
+  ok=1;
   for(;;){
-    row=mysql_fetch_row(res);
-    if(row==NULL)break;
-    dxcc=atoi(row[0]);
-    if(dxcc<0 || dxcc>=CONTEST_DXCC_MAX || row[1]==NULL)continue;
-    cont[dxcc][0]=row[1][0];
-    cont[dxcc][1]=row[1][1];
+    rc=sqlite3_step(stmt);
+    if(rc==SQLITE_DONE)break;
+    if(rc!=SQLITE_ROW){ok=0; break;}
+    dxcc=sqlite3_column_int(stmt,0);
+    text=sqlite3_column_text(stmt,1);
+    if(dxcc<0 || dxcc>=CONTEST_DXCC_MAX || text==NULL)continue;
+    cont[dxcc][0]=(char)text[0];
+    cont[dxcc][1]=(char)text[1];
     cont[dxcc][2]='\0';
-    if(row[2]!=NULL && atoi(row[2])>1)ambiguous[dxcc]=1;
+    if(sqlite3_column_int(stmt,2)>1)ambiguous[dxcc]=1;
   }
-  mysql_free_result(res);
-  return 1;
+  sqlite3_finalize(stmt);
+  sqlite3_close(db);
+  return ok;
 }
 
-static ContestQso *contest_load_qso(MYSQL *con,const char *esc_mycall,const char *esc_contest,unsigned long *count,int present[]) {
-  MYSQL_RES *res;
-  MYSQL_ROW row;
+static ContestQso *contest_load_qso(QsozDb *con,const char *esc_mycall,const char *esc_contest,unsigned long *count,int present[]) {
+  QsozResult *res;
+  QsozRow row;
   ContestQso *q,*newq;
   unsigned long n,cap,newcap;
   char query[1024];
@@ -91,21 +98,21 @@ static ContestQso *contest_load_qso(MYSQL *con,const char *esc_mycall,const char
   *count=0;
   memset(present,0,CONTEST_BANDS*sizeof(int));
   snprintf(query,sizeof(query),"select open,freqtx,callsign,dxcc from log where mycall='%s' and contest='%s' order by open,callsign",esc_mycall,esc_contest);
-  if(mysql_query(con,query)!=0)return NULL;
-  res=mysql_use_result(con);
+  if(qsoz_db_query(con,query)!=0)return NULL;
+  res=qsoz_db_result(con);
   if(res==NULL)return NULL;
   q=NULL;
   n=0;
   cap=0;
   for(;;){
-    row=mysql_fetch_row(res);
+    row=qsoz_db_fetch(res);
     if(row==NULL)break;
-    if(n>=CONTEST_QSO_MAX){free(q); mysql_free_result(res); return NULL;}
+    if(n>=CONTEST_QSO_MAX){free(q); qsoz_db_result_free(res); return NULL;}
     if(n==cap){
       newcap=cap==0?1024UL:cap*2UL;
       if(newcap>CONTEST_QSO_MAX)newcap=CONTEST_QSO_MAX;
       newq=(ContestQso *)realloc(q,(size_t)newcap*sizeof(ContestQso));
-      if(newq==NULL){free(q); mysql_free_result(res); return NULL;}
+      if(newq==NULL){free(q); qsoz_db_result_free(res); return NULL;}
       q=newq;
       cap=newcap;
     }
@@ -117,7 +124,7 @@ static ContestQso *contest_load_qso(MYSQL *con,const char *esc_mycall,const char
     if(b>=0)present[b]=1;
     n++;
   }
-  mysql_free_result(res);
+  qsoz_db_result_free(res);
   *count=n;
   return q;
 }
@@ -144,7 +151,7 @@ static void contest_print_ontime(const ContestQso *q,unsigned long count) {
   printf("</pre>");
 }
 
-static void contest_print_matrix(MYSQL *con,const ContestQso *q,unsigned long count,const int present[],char dxcc_cont[][3],const unsigned char ambiguous[]) {
+static void contest_print_matrix(const ContestQso *q,unsigned long count,const int present[],char dxcc_cont[][3],const unsigned char ambiguous[]) {
   long matrix[CONTEST_BANDS][CONTEST_CONTINENTS],total,band_total,cached;
   unsigned long i;
   int b,c,j,rc;
@@ -161,7 +168,7 @@ static void contest_print_matrix(MYSQL *con,const ContestQso *q,unsigned long co
     if(ambiguous[q[i].dxcc]){
       cached=numdata3(1,0,q[i].call);
       if(cached==0){
-        rc=radio_cty_lookup(con,q[i].call,&cty);
+        rc=radio_cty_lookup(q[i].call,&cty);
         c=rc==1?contest_continent(cty.cont):-1;
         cached=c>=0?(long)c+1L:100L;
         incdata3(1,0,q[i].call,cached,0);
@@ -288,7 +295,7 @@ static void contest_print_rate(const ContestQso *q,unsigned long count,const int
   if(fp!=NULL)fclose(fp);
 }
 
-int qsoz_contest_details_print(MYSQL *con,const char *esc_mycall,const char *esc_contest) {
+int qsoz_contest_details_print(QsozDb *con,const char *esc_mycall,const char *esc_contest) {
   ContestQso *q;
   unsigned long count;
   int present[CONTEST_BANDS];
@@ -298,9 +305,9 @@ int qsoz_contest_details_print(MYSQL *con,const char *esc_mycall,const char *esc
   if(con==NULL || esc_mycall==NULL || esc_contest==NULL)return 0;
   q=contest_load_qso(con,esc_mycall,esc_contest,&count,present);
   if(q==NULL || count==0){free(q); return 0;}
-  if(!contest_load_continents(con,dxcc_cont,ambiguous)){free(q); return 0;}
+  if(!contest_load_continents(dxcc_cont,ambiguous)){free(q); return 0;}
   contest_print_ontime(q,count);
-  contest_print_matrix(con,q,count,present,dxcc_cont,ambiguous);
+  contest_print_matrix(q,count,present,dxcc_cont,ambiguous);
   contest_print_band_growth(q,count,present);
   contest_print_rate(q,count,present);
   free(q);

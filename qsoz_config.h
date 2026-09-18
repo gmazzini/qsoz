@@ -1,4 +1,4 @@
-// Gianluca Mazzini @2022- Version 3.0
+// Gianluca Mazzini @2022- Version 4.12
 #ifndef QSOZ_CONFIG_H
 #define QSOZ_CONFIG_H
 
@@ -6,11 +6,6 @@
 #define QSOZ_CFG_VALUE 256
 
 typedef struct {
-  char db_host[QSOZ_CFG_VALUE];
-  char db_user[QSOZ_CFG_VALUE];
-  char db_pass[QSOZ_CFG_VALUE];
-  char db_name[QSOZ_CFG_VALUE];
-  unsigned int db_port;
   char callbook_host[QSOZ_CFG_VALUE];
   unsigned int callbook_port;
   unsigned int callbook_timeout;

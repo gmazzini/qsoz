@@ -1,14 +1,20 @@
-// Gianluca Mazzini @2022- Version 4.1
+// Gianluca Mazzini @2022- Version 4.7
 #include <ctype.h>
+#include <errno.h>
+#include <fcntl.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/file.h>
+#include <sys/stat.h>
 #include <time.h>
+#include <unistd.h>
 #include <curl/curl.h>
+#include <sqlite3.h>
 #include <zip.h>
-#include <mysql/mysql.h>
-#include "qsoz_config.h"
 #include "qsoz_util.h"
+#include "qsoz_user.h"
+#include "/home/tools/mcp/work/data/radio_data.h"
 
 #define CTY_URL "https://www.country-files.com/bigcty/download/bigcty.zip"
 #define DOWNLOAD_MAX (8UL*1024UL*1024UL)
@@ -17,21 +23,20 @@
 #define FIELD_COUNT 10
 
 static const char *create_sql=
-  "CREATE TABLE cty_new ("
-  "base varchar(10) NOT NULL,"
-  "name varchar(50) NOT NULL,"
-  "dxcc int(11) NOT NULL,"
-  "cont varchar(2) NOT NULL,"
-  "cqzone int(11) NOT NULL,"
-  "ituzone int(11) NOT NULL,"
-  "latitude float NOT NULL,"
-  "longitude float NOT NULL,"
-  "gmtshift float NOT NULL,"
-  "prefix varchar(20) NOT NULL,"
-  "KEY dxcc (dxcc),KEY prefix (prefix)) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_general_ci";
+  "create table cty("
+  "base text not null,"
+  "name text not null,"
+  "dxcc integer not null,"
+  "cont text not null,"
+  "cqzone integer not null,"
+  "ituzone integer not null,"
+  "latitude real not null,"
+  "longitude real not null,"
+  "gmtshift real not null,"
+  "prefix text not null collate nocase)";
 
 static const char *insert_sql=
-  "INSERT INTO cty_new (base,name,dxcc,cont,cqzone,ituzone,latitude,longitude,gmtshift,prefix) VALUES (?,?,?,?,?,?,?,?,?,?)";
+  "insert into cty(base,name,dxcc,cont,cqzone,ituzone,latitude,longitude,gmtshift,prefix) values(?,?,?,?,?,?,?,?,?,?)";
 
 typedef struct {
   unsigned char *ptr;
@@ -83,7 +88,7 @@ static int download_zip(Mem *m,char *err,unsigned long errcap) {
   curl_easy_setopt(curl,CURLOPT_NOSIGNAL,1L);
   curl_easy_setopt(curl,CURLOPT_SSL_VERIFYPEER,1L);
   curl_easy_setopt(curl,CURLOPT_SSL_VERIFYHOST,2L);
-  curl_easy_setopt(curl,CURLOPT_USERAGENT,"qsoz-pcty/3.0");
+  curl_easy_setopt(curl,CURLOPT_USERAGENT,"qsoz-cty/4.7");
   rc=curl_easy_perform(curl);
   status=0;
   if(rc==CURLE_OK)curl_easy_getinfo(curl,CURLINFO_RESPONSE_CODE,&status);
@@ -197,36 +202,26 @@ static int parse_double_value(const char *s,double *value) {
   return end!=s && *end=='\0';
 }
 
-static int bind_text(MYSQL_BIND *b,const char *s,unsigned long *len) {
-  *len=(unsigned long)strlen(s);
-  memset(b,0,sizeof(*b));
-  b->buffer_type=MYSQL_TYPE_STRING;
-  b->buffer=(void *)s;
-  b->buffer_length=*len;
-  b->length=len;
-  return 1;
+static int insert_prefix(sqlite3_stmt *stmt,const char *base,const char *name,long dxcc,const char *cont,long cq,long itu,double lat,double lon,double gmt,const char *prefix) {
+  int rc;
+
+  sqlite3_bind_text(stmt,1,base,-1,SQLITE_TRANSIENT);
+  sqlite3_bind_text(stmt,2,name,-1,SQLITE_TRANSIENT);
+  sqlite3_bind_int64(stmt,3,(sqlite3_int64)dxcc);
+  sqlite3_bind_text(stmt,4,cont,-1,SQLITE_TRANSIENT);
+  sqlite3_bind_int64(stmt,5,(sqlite3_int64)cq);
+  sqlite3_bind_int64(stmt,6,(sqlite3_int64)itu);
+  sqlite3_bind_double(stmt,7,lat);
+  sqlite3_bind_double(stmt,8,lon);
+  sqlite3_bind_double(stmt,9,gmt);
+  sqlite3_bind_text(stmt,10,prefix,-1,SQLITE_TRANSIENT);
+  rc=sqlite3_step(stmt);
+  sqlite3_reset(stmt);
+  sqlite3_clear_bindings(stmt);
+  return rc==SQLITE_DONE;
 }
 
-static int insert_prefix(MYSQL_STMT *stmt,const char *base,const char *name,long dxcc,const char *cont,long cq,long itu,double lat,double lon,double gmt,const char *prefix) {
-  MYSQL_BIND b[FIELD_COUNT];
-  unsigned long len[4];
-
-  memset(b,0,sizeof(b));
-  bind_text(&b[0],base,&len[0]);
-  bind_text(&b[1],name,&len[1]);
-  b[2].buffer_type=MYSQL_TYPE_LONG; b[2].buffer=&dxcc;
-  bind_text(&b[3],cont,&len[2]);
-  b[4].buffer_type=MYSQL_TYPE_LONG; b[4].buffer=&cq;
-  b[5].buffer_type=MYSQL_TYPE_LONG; b[5].buffer=&itu;
-  b[6].buffer_type=MYSQL_TYPE_DOUBLE; b[6].buffer=&lat;
-  b[7].buffer_type=MYSQL_TYPE_DOUBLE; b[7].buffer=&lon;
-  b[8].buffer_type=MYSQL_TYPE_DOUBLE; b[8].buffer=&gmt;
-  bind_text(&b[9],prefix,&len[3]);
-  if(mysql_stmt_bind_param(stmt,b)!=0)return 0;
-  return mysql_stmt_execute(stmt)==0;
-}
-
-static int import_line(MYSQL_STMT *stmt,char *line,unsigned long *count) {
+static int import_line(sqlite3_stmt *stmt,char *line,unsigned long *count) {
   char *f[FIELD_COUNT],*p,*end,*next;
   char base[16],name[64],cont[8],tmp[64],prefix[64];
   long dxcc,cq,itu;
@@ -270,31 +265,96 @@ static int import_line(MYSQL_STMT *stmt,char *line,unsigned long *count) {
   return 1;
 }
 
-static int import_csv(MYSQL *con,unsigned char *csv,unsigned long len,unsigned long *count,char *err,unsigned long errcap) {
-  MYSQL_STMT *stmt;
+static int import_csv(sqlite3 *db,unsigned char *csv,unsigned long len,unsigned long *count,char *err,unsigned long errcap) {
+  sqlite3_stmt *stmt;
   char *line,*p,*e;
   unsigned long lineno;
 
-  if(mysql_query(con,"DROP TABLE IF EXISTS cty_new")!=0 || mysql_query(con,create_sql)!=0){snprintf(err,(size_t)errcap,"cannot create cty_new: %s",mysql_error(con)); return 0;}
-  stmt=mysql_stmt_init(con);
-  if(stmt==NULL || mysql_stmt_prepare(stmt,insert_sql,(unsigned long)strlen(insert_sql))!=0){if(stmt!=NULL)mysql_stmt_close(stmt); snprintf(err,(size_t)errcap,"cannot prepare CTY insert"); return 0;}
+  stmt=NULL;
+  if(sqlite3_prepare_v2(db,insert_sql,-1,&stmt,NULL)!=SQLITE_OK){snprintf(err,(size_t)errcap,"cannot prepare CTY insert: %s",sqlite3_errmsg(db)); return 0;}
   *count=0;
   p=(char *)csv;
   lineno=0;
   for(;p<(char *)csv+len;){
     e=memchr(p,'\n',(size_t)(((char *)csv+len)-p));
     if(e==NULL)e=(char *)csv+len;
-    if((unsigned long)(e-p)>=LINE_MAX_SIZE){snprintf(err,(size_t)errcap,"CTY line too long"); mysql_stmt_close(stmt); return 0;}
+    if((unsigned long)(e-p)>=LINE_MAX_SIZE){snprintf(err,(size_t)errcap,"CTY line too long"); sqlite3_finalize(stmt); return 0;}
     if(e<(char *)csv+len)*e='\0';
     if(e>p && e[-1]=='\r')e[-1]='\0';
     lineno++;
     line=p;
-    if(*line!='\0' && !import_line(stmt,line,count)){snprintf(err,(size_t)errcap,"invalid CTY data at line %lu",lineno); mysql_stmt_close(stmt); return 0;}
+    if(*line!='\0' && !import_line(stmt,line,count)){snprintf(err,(size_t)errcap,"invalid CTY data at line %lu: %s",lineno,sqlite3_errmsg(db)); sqlite3_finalize(stmt); return 0;}
     p=e+1;
   }
-  mysql_stmt_close(stmt);
+  sqlite3_finalize(stmt);
   if(*count<20000UL){snprintf(err,(size_t)errcap,"CTY validation failed: only %lu entries",*count); return 0;}
   return 1;
+}
+
+static int lock_rebuild(char *err,unsigned long errcap) {
+  int fd;
+
+  fd=open("/home/tools/mcp/work/qsoz/tmpdata/cty.lock",O_WRONLY|O_CREAT,0600);
+  if(fd<0){snprintf(err,(size_t)errcap,"cannot open CTY lock: %s",strerror(errno)); return -1;}
+  if(flock(fd,LOCK_EX|LOCK_NB)!=0){close(fd); snprintf(err,(size_t)errcap,"CTY update is already running"); return -1;}
+  return fd;
+}
+
+static int quick_check(sqlite3 *db,char *err,unsigned long errcap) {
+  sqlite3_stmt *stmt;
+  const unsigned char *text;
+  int ok;
+
+  stmt=NULL;
+  if(sqlite3_prepare_v2(db,"pragma quick_check",-1,&stmt,NULL)!=SQLITE_OK){snprintf(err,(size_t)errcap,"CTY integrity check failed: %s",sqlite3_errmsg(db)); return 0;}
+  ok=0;
+  if(sqlite3_step(stmt)==SQLITE_ROW){
+    text=sqlite3_column_text(stmt,0);
+    if(text!=NULL && strcmp((const char *)text,"ok")==0)ok=1;
+  }
+  sqlite3_finalize(stmt);
+  if(!ok)snprintf(err,(size_t)errcap,"CTY integrity check failed");
+  return ok;
+}
+
+static int build_sqlite(unsigned char *csv,unsigned long len,unsigned long *count,char *err,unsigned long errcap) {
+  sqlite3 *db;
+  sqlite3_stmt *stmt;
+  char path[512];
+  long long rows;
+  int rc,ok;
+
+  snprintf(path,sizeof(path),"%s.new.%ld",RADIO_CTY_DB,(long)getpid());
+  unlink(path);
+  db=NULL;
+  ok=0;
+  rc=sqlite3_open_v2(path,&db,SQLITE_OPEN_READWRITE|SQLITE_OPEN_CREATE,NULL);
+  if(rc!=SQLITE_OK){snprintf(err,(size_t)errcap,"cannot create CTY database: %s",db==NULL?"unknown SQLite error":sqlite3_errmsg(db)); goto end;}
+  if(sqlite3_exec(db,"pragma journal_mode=off; pragma synchronous=off",NULL,NULL,NULL)!=SQLITE_OK){snprintf(err,(size_t)errcap,"cannot initialize CTY database: %s",sqlite3_errmsg(db)); goto end;}
+  if(sqlite3_exec(db,create_sql,NULL,NULL,NULL)!=SQLITE_OK){snprintf(err,(size_t)errcap,"cannot create CTY table: %s",sqlite3_errmsg(db)); goto end;}
+  if(sqlite3_exec(db,"begin",NULL,NULL,NULL)!=SQLITE_OK){snprintf(err,(size_t)errcap,"cannot start CTY transaction: %s",sqlite3_errmsg(db)); goto end;}
+  if(!import_csv(db,csv,len,count,err,errcap)){sqlite3_exec(db,"rollback",NULL,NULL,NULL); goto end;}
+  if(sqlite3_exec(db,"commit; create index cty_prefix on cty(prefix); create index cty_dxcc on cty(dxcc)",NULL,NULL,NULL)!=SQLITE_OK){snprintf(err,(size_t)errcap,"cannot index CTY database: %s",sqlite3_errmsg(db)); goto end;}
+  stmt=NULL;
+  if(sqlite3_prepare_v2(db,"select count(*) from cty",-1,&stmt,NULL)!=SQLITE_OK){snprintf(err,(size_t)errcap,"cannot validate CTY database: %s",sqlite3_errmsg(db)); goto end;}
+  rows=-1;
+  if(sqlite3_step(stmt)==SQLITE_ROW)rows=sqlite3_column_int64(stmt,0);
+  sqlite3_finalize(stmt);
+  if(rows!=(long long)*count){snprintf(err,(size_t)errcap,"CTY row count mismatch"); goto end;}
+  if(!quick_check(db,err,errcap))goto end;
+  if(sqlite3_close(db)!=SQLITE_OK){db=NULL; snprintf(err,(size_t)errcap,"cannot close CTY database"); goto end_file;}
+  db=NULL;
+  if(chmod(path,0600)!=0){snprintf(err,(size_t)errcap,"cannot set CTY database permissions: %s",strerror(errno)); goto end_file;}
+  if(rename(path,RADIO_CTY_DB)!=0){snprintf(err,(size_t)errcap,"cannot activate CTY database: %s",strerror(errno)); goto end_file;}
+  ok=1;
+  goto done;
+
+end:
+  if(db!=NULL)sqlite3_close(db);
+end_file:
+  unlink(path);
+done:
+  return ok;
 }
 
 static void release_text(const unsigned char *readme,unsigned long len,char *out,unsigned long cap) {
@@ -312,36 +372,18 @@ static void release_text(const unsigned char *readme,unsigned long len,char *out
   out[n]='\0';
 }
 
-static int auth_admin(MYSQL *con,const char *ota) {
-  MYSQL_RES *res;
-  MYSQL_ROW row;
-  char query[256];
-  int ok;
-
-  snprintf(query,sizeof(query),"select mycall from user where ota='%s' and lastota+durationota>%ld limit 1",ota,(long)time(NULL));
-  if(mysql_query(con,query)!=0)return 0;
-  res=mysql_store_result(con);
-  if(res==NULL)return 0;
-  row=mysql_fetch_row(res);
-  ok=row!=NULL && row[0]!=NULL && strcmp(row[0],"IK4LZH")==0;
-  mysql_free_result(res);
-  return ok;
-}
-
 int qsoz_cty_main(void) {
-  QsozConfig cfg;
-  MYSQL *con;
   Mem zipmem;
   zip_source_t *source;
   zip_t *za;
   unsigned char *csv,*readme;
   unsigned long csvlen,readmelen,count,n;
   char ota[64],err[256],release[256];
-  int ok;
+  int ok,lockfd,curl_ready;
 
-  con=NULL; source=NULL; za=NULL; csv=NULL; readme=NULL;
+  source=NULL; za=NULL; csv=NULL; readme=NULL;
   memset(&zipmem,0,sizeof(zipmem));
-  err[0]='\0'; release[0]='\0'; count=0;
+  err[0]='\0'; release[0]='\0'; count=0; lockfd=-1; curl_ready=0;
   n=(unsigned long)fread(ota,1,sizeof(ota)-1,stdin);
   ota[n]='\0';
   for(;n>0 && (ota[n-1]=='\r' || ota[n-1]=='\n' || isspace((unsigned char)ota[n-1]));n--)ota[n-1]='\0';
@@ -349,38 +391,29 @@ int qsoz_cty_main(void) {
     printf("Content-Type: text/html; charset=utf-8\r\n\r\n<!--32--><pre><b>Login expired</b></pre>");
     return 0;
   }
-  if(!qsoz_config_load(&cfg,QSOZ_CONFIG_FILE,err,sizeof(err)))goto fail;
-  con=mysql_init(NULL);
-  if(con==NULL){snprintf(err,sizeof(err),"database initialization failed"); goto fail;}
-  if(mysql_real_connect(con,cfg.db_host,cfg.db_user,cfg.db_pass,cfg.db_name,cfg.db_port,NULL,0)==NULL){snprintf(err,sizeof(err),"database connection failed"); goto fail;}
-  mysql_query(con,"SET time_zone='+00:00'");
-  if(!auth_admin(con,ota)){snprintf(err,sizeof(err),"CTY update is restricted to IK4LZH"); goto fail;}
+  if(!qsoz_user_admin(ota)){snprintf(err,sizeof(err),"CTY update is restricted to IK4LZH"); goto fail;}
+  lockfd=lock_rebuild(err,sizeof(err));
+  if(lockfd<0)goto fail;
   if(curl_global_init(CURL_GLOBAL_DEFAULT)!=CURLE_OK){snprintf(err,sizeof(err),"curl global initialization failed"); goto fail;}
+  curl_ready=1;
   ok=download_zip(&zipmem,err,sizeof(err));
-  if(!ok)goto fail_curl;
+  if(!ok)goto fail;
   za=open_zip(&zipmem,&source,err,sizeof(err));
-  if(za==NULL)goto fail_curl;
-  if(!zip_read_file(za,"cty.csv",&csv,&csvlen,CSV_MAX,err,sizeof(err)))goto fail_zip;
-  if(!zip_read_file(za,"README.TXT",&readme,&readmelen,1024UL*1024UL,err,sizeof(err)))goto fail_zip;
+  if(za==NULL)goto fail;
+  if(!zip_read_file(za,"cty.csv",&csv,&csvlen,CSV_MAX,err,sizeof(err)))goto fail;
+  if(!zip_read_file(za,"README.TXT",&readme,&readmelen,1024UL*1024UL,err,sizeof(err)))goto fail;
   release_text(readme,readmelen,release,sizeof(release));
-  if(!import_csv(con,csv,csvlen,&count,err,sizeof(err)))goto fail_import;
-  if(mysql_query(con,"DROP TABLE IF EXISTS cty_old")!=0){snprintf(err,sizeof(err),"cannot remove old CTY staging table"); goto fail_import;}
-  if(mysql_query(con,"RENAME TABLE cty TO cty_old, cty_new TO cty")!=0){snprintf(err,sizeof(err),"CTY atomic swap failed: %s",mysql_error(con)); goto fail_import;}
-  if(mysql_query(con,"DROP TABLE cty_old")!=0){snprintf(err,sizeof(err),"CTY updated but old table cleanup failed"); goto fail_import;}
+  if(!build_sqlite(csv,csvlen,&count,err,sizeof(err)))goto fail;
   printf("Content-Type: text/html; charset=utf-8\r\n\r\n<!--32--><pre><b>CTY updated</b>\n%s\nEntries: %lu\n</pre>",release,count);
-  free(readme); free(csv); zip_close(za); free(zipmem.ptr); curl_global_cleanup(); mysql_close(con);
+  free(readme); free(csv); zip_close(za); free(zipmem.ptr); curl_global_cleanup(); flock(lockfd,LOCK_UN); close(lockfd);
   return 0;
 
-fail_import:
-  mysql_query(con,"DROP TABLE IF EXISTS cty_new");
-fail_zip:
+fail:
   free(readme); free(csv);
   if(za!=NULL)zip_close(za);
-fail_curl:
   free(zipmem.ptr);
-  curl_global_cleanup();
-fail:
+  if(curl_ready)curl_global_cleanup();
+  if(lockfd>=0){flock(lockfd,LOCK_UN); close(lockfd);}
   printf("Content-Type: text/html; charset=utf-8\r\n\r\n<!--32--><pre><b>CTY update failed</b>\n%s\n</pre>",err[0]?err:"unknown error");
-  if(con!=NULL)mysql_close(con);
   return 0;
 }

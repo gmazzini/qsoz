@@ -1,4 +1,4 @@
-// Gianluca Mazzini @2022- Version 4.1
+// Gianluca Mazzini @2022- Version 4.6
 #include <errno.h>
 #include <fcntl.h>
 #include <netdb.h>
@@ -9,8 +9,7 @@
 #include <unistd.h>
 #include <sys/select.h>
 #include <sys/socket.h>
-#include <mysql/mysql.h>
-#include "qsoz_config.h"
+#include "qsoz_user.h"
 
 #define INPUT_SIZE 256
 #define QUERY_SIZE 512
@@ -187,36 +186,6 @@ static int recv_idle(int fd,char *buf,unsigned long cap,unsigned int idle_ms) {
   return got;
 }
 
-static int load_radio(MYSQL *con,const char *ota,char *radio,unsigned long rcap,char *udef1,unsigned long u1cap,char *udef2,unsigned long u2cap) {
-  MYSQL_RES *res;
-  MYSQL_ROW row;
-  char escaped[257],query[QUERY_SIZE];
-  unsigned long n;
-
-  mysql_real_escape_string(con,escaped,ota,(unsigned long)strlen(ota));
-  n=(unsigned long)snprintf(query,sizeof(query),"select radio,udef1,udef2 from user where ota='%s' and lastota+durationota>%lld limit 1",escaped,(long long)time(NULL));
-  if (n>=sizeof(query) || mysql_query(con,query)!=0) return 0;
-  res=mysql_store_result(con);
-  if (res==NULL) return 0;
-  row=mysql_fetch_row(res);
-  if (row==NULL || row[0]==NULL || strlen(row[0])>=rcap) {
-    mysql_free_result(res);
-    return 0;
-  }
-  strcpy(radio,row[0]);
-  udef1[0]=udef2[0]='\0';
-  if (row[1]!=NULL) {
-    strncpy(udef1,row[1],u1cap-1);
-    udef1[u1cap-1]='\0';
-  }
-  if (row[2]!=NULL) {
-    strncpy(udef2,row[2],u2cap-1);
-    udef2[u2cap-1]='\0';
-  }
-  mysql_free_result(res);
-  return 1;
-}
-
 static int mode_index(const char *mode) {
   int i;
 
@@ -330,10 +299,9 @@ fail:
 }
 
 int qsoz_radio_main(void) {
-  QsozConfig cfg;
-  MYSQL *con;
+  QsozUser qso_user;
   char tok[3][128],radio[RADIO_SIZE],copy[RADIO_SIZE],udef1[UDEF_SIZE],udef2[UDEF_SIZE];
-  char *type,*host,*sport,*user,*pass,*end,err[ERR_SIZE];
+  char *type,*host,*sport,*user,*pass,*end;
   unsigned long port;
   int ok;
 
@@ -342,24 +310,12 @@ int qsoz_radio_main(void) {
     printf("0,ND\n");
     return 0;
   }
-  if (!qsoz_config_load(&cfg,QSOZ_CONFIG_FILE,err,sizeof(err))) {
-    fprintf(stderr,"pradio: %s\n",err);
-    printf("0,ND\n");
-    return 0;
+  ok=qsoz_user_session(tok[0],&qso_user);
+  if(ok) {
+    strcpy(radio,qso_user.radio);
+    strcpy(udef1,qso_user.udef1);
+    strcpy(udef2,qso_user.udef2);
   }
-  con=mysql_init(NULL);
-  if (con==NULL) {
-    printf("0,ND\n");
-    return 0;
-  }
-  if (mysql_real_connect(con,cfg.db_host,cfg.db_user,cfg.db_pass,cfg.db_name,cfg.db_port,NULL,0)==NULL) {
-    fprintf(stderr,"pradio: mysql connect error: %s\n",mysql_error(con));
-    mysql_close(con);
-    printf("0,ND\n");
-    return 0;
-  }
-  ok=load_radio(con,tok[0],radio,sizeof(radio),udef1,sizeof(udef1),udef2,sizeof(udef2));
-  mysql_close(con);
   if (!ok) {
     printf("0,ND\n");
     return 0;

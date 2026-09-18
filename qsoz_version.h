@@ -1,7 +1,7 @@
-// Gianluca Mazzini @2022- Version 4.3
+// Gianluca Mazzini @2022- Version 4.13
 #ifndef QSOZ_VERSION_H
 #define QSOZ_VERSION_H
 
-#define QSOZ_RELEASE "4.4"
+#define QSOZ_RELEASE "4.13"
 
 #endif

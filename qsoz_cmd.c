@@ -1,13 +1,13 @@
-// Gianluca Mazzini @2022- Version 4.1
+// Gianluca Mazzini @2022- Version 4.12
 #include <errno.h>
 #include <limits.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
-#include <mysql/mysql.h>
-#include "qsoz_config.h"
+#include "qsoz_db.h"
 #include "qsoz_time.h"
+#include "qsoz_user.h"
 
 #define INPUT_SIZE 512
 #define QUERY_SIZE 1024
@@ -63,43 +63,20 @@ static int valid_len(const char *s,unsigned long max) {
   return n>0 && n<=max;
 }
 
-static int escape_value(MYSQL *con,char *dst,unsigned long cap,const char *src) {
+static int escape_value(char *dst,unsigned long cap,const char *src) {
   unsigned long n;
 
   if(cap<3)return 0;
-  n=mysql_real_escape_string(con,dst,src,(unsigned long)strlen(src));
+  n=qsoz_db_escape_raw(dst,src,(unsigned long)strlen(src));
   return n<cap;
 }
 
-static int get_mycall(MYSQL *con,const char *ota,char *mycall,unsigned long cap) {
-  MYSQL_RES *res;
-  MYSQL_ROW row;
-  char esc[OTA_SIZE*2+1],query[QUERY_SIZE];
-  time_t now;
-  int ok;
-
-  if(!escape_value(con,esc,sizeof(esc),ota))return 0;
-  now=time(NULL);
-  sprintf(query,"select mycall from user where ota='%s' and lastota+durationota>%lld limit 1",esc,(long long)now);
-  if(mysql_query(con,query)!=0)return 0;
-  res=mysql_store_result(con);
-  if(res==NULL)return 0;
-  row=mysql_fetch_row(res);
-  ok=0;
-  if(row!=NULL && row[0]!=NULL && strlen(row[0])<cap) {
-    strcpy(mycall,row[0]);
-    ok=1;
-  }
-  mysql_free_result(res);
-  return ok;
-}
-
 int qsoz_cmd_main(void) {
-  QsozConfig cfg;
-  MYSQL *con;
+  QsozUser user;
+  QsozDb *con;
   char input[INPUT_SIZE],*tok[4],mycall[CALL_SIZE+1],command[COMMAND_SIZE+1];
   char esc_mycall[CALL_SIZE*2+1],esc_call[CALL_SIZE*2+1],esc_value[COMMAND_SIZE*2+1];
-  char query[QUERY_SIZE],err[256],*eq,*key,*value,*column;
+  char query[QUERY_SIZE],*eq,*key,*value,*column;
   long open,n;
   time_t epoch;
   unsigned long maxlen;
@@ -117,32 +94,20 @@ int qsoz_cmd_main(void) {
     return 0;
   }
   strcpy(command,tok[3]);
-  if(!qsoz_config_load(&cfg,QSOZ_CONFIG_FILE,err,sizeof(err))) {
-    fprintf(stderr,"pcmd: %s\n",err);
-    printf("ERROR\n");
-    return 1;
-  }
-
-  con=mysql_init(NULL);
-  if(con==NULL) {
-    fprintf(stderr,"pcmd: mysql_init failed\n");
-    printf("ERROR\n");
-    return 1;
-  }
-  if(mysql_real_connect(con,cfg.db_host,cfg.db_user,cfg.db_pass,cfg.db_name,cfg.db_port,NULL,0)==NULL) {
-    fprintf(stderr,"pcmd: mysql connect: %s\n",mysql_error(con));
-    mysql_close(con);
-    printf("ERROR\n");
-    return 1;
-  }
-  if(!get_mycall(con,tok[0],mycall,sizeof(mycall))) {
+  if(!qsoz_user_session(tok[0],&user)) {
     fprintf(stderr,"pcmd: invalid or expired session\n");
-    mysql_close(con);
     printf("ERROR\n");
     return 0;
   }
-  if(!escape_value(con,esc_mycall,sizeof(esc_mycall),mycall) || !escape_value(con,esc_call,sizeof(esc_call),tok[2])) {
-    mysql_close(con);
+  strcpy(mycall,user.mycall);
+  con=qsoz_db_open();
+  if(con==NULL) {
+    fprintf(stderr,"pcmd: cannot open log database\n");
+    printf("ERROR\n");
+    return 1;
+  }
+  if(!escape_value(esc_mycall,sizeof(esc_mycall),mycall) || !escape_value(esc_call,sizeof(esc_call),tok[2])) {
+    qsoz_db_close(con);
     printf("ERROR\n");
     return 1;
   }
@@ -174,41 +139,41 @@ int qsoz_cmd_main(void) {
   else if(strcmp(key,"COR")==0 || strcmp(key,"CONTESTRX")==0) {column="contestrx"; maxlen=10; is_string=1;}
   else {
     fprintf(stderr,"pcmd: unknown command\n");
-    mysql_close(con);
+    qsoz_db_close(con);
     printf("ERROR\n");
     return 0;
   }
 
   if(is_delete) {
     if(value!=NULL) {
-      mysql_close(con);
+      qsoz_db_close(con);
       printf("ERROR\n");
       return 0;
     }
     sprintf(query,"delete from log where mycall='%s' and callsign='%s' and open=%ld",esc_mycall,esc_call,open);
   } else {
     if(value==NULL || *value=='\0') {
-      mysql_close(con);
+      qsoz_db_close(con);
       printf("ERROR\n");
       return 0;
     }
     if(is_string) {
-      if(!valid_len(value,maxlen) || !escape_value(con,esc_value,sizeof(esc_value),value)) {
-        mysql_close(con);
+      if(!valid_len(value,maxlen) || !escape_value(esc_value,sizeof(esc_value),value)) {
+        qsoz_db_close(con);
         printf("ERROR\n");
         return 0;
       }
       sprintf(query,"update log set %s='%s' where mycall='%s' and callsign='%s' and open=%ld",column,esc_value,esc_mycall,esc_call,open);
     } else if(is_freq) {
       if(!parse_long(value,&n) || n<0 || n>LONG_MAX/1000L) {
-        mysql_close(con);
+        qsoz_db_close(con);
         printf("ERROR\n");
         return 0;
       }
       sprintf(query,"update log set %s=%ld where mycall='%s' and callsign='%s' and open=%ld",column,n*1000L,esc_mycall,esc_call,open);
     } else {
       if(!qsoz_datetime_to_epoch(value,&epoch)) {
-        mysql_close(con);
+        qsoz_db_close(con);
         printf("ERROR\n");
         return 0;
       }
@@ -216,13 +181,13 @@ int qsoz_cmd_main(void) {
     }
   }
 
-  if(mysql_query(con,query)!=0) {
-    fprintf(stderr,"pcmd: mysql query: %s\n",mysql_error(con));
-    mysql_close(con);
+  if(qsoz_db_query(con,query)!=0) {
+    fprintf(stderr,"pcmd: database query: %s\n",qsoz_db_error(con));
+    qsoz_db_close(con);
     printf("ERROR\n");
     return 1;
   }
-  mysql_close(con);
+  qsoz_db_close(con);
   printf("OK\n");
   return 0;
 }

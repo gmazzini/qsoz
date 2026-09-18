@@ -1,13 +1,13 @@
-// Gianluca Mazzini @2022- Version 3.02
+// Gianluca Mazzini @2022- Version 4.12
 #include <ctype.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
-#include <mysql/mysql.h>
+#include "qsoz_db.h"
+#include <sqlite3.h>
 #include "qsoz_stats.h"
 #include "qsoz_util.h"
-#include "qsoz_db.h"
 #include "qsoz_score.h"
 #include "/home/tools/mcp/work/data/radio_data.h"
 
@@ -75,13 +75,13 @@ int conscore_supported(const char *contest) {
   return 0;
 }
 
-void conscore_setup(MYSQL *con,char tok[][100],char *mycall){
-  int vv,c;
+void conscore_setup(char tok[][100],char *mycall){
+  sqlite3 *db;
+  sqlite3_stmt *stmt;
+  const unsigned char *text;
+  int vv,c,rc,ok;
   RadioCty cty;
-  char buf[1000];
-  MYSQL_RES *res;
-  MYSQL_ROW row;
-  
+
   vv=sizeof(conid)/sizeof(conid[0]);
   for(contype=0;contype<vv;contype++)if(strncmp(tok[9],conid[contype],strlen(conid[contype]))==0)break;
   if(contype==vv){
@@ -89,34 +89,41 @@ void conscore_setup(MYSQL *con,char tok[][100],char *mycall){
     return;
   }
   qsoz_stats_reset();
-  if(radio_cty_lookup(con,mycall,&cty)!=1){home_dxcc=-1; contype=-1; return;}
+  if(radio_cty_lookup(mycall,&cty)!=1){home_dxcc=-1; contype=-1; return;}
   home_dxcc=atoi(cty.dxcc);
   if(home_dxcc<0 || home_dxcc>=1000){home_dxcc=-1; contype=-1; return;}
   memset(cont,0,sizeof(cont));
   memset(cqz,0,sizeof(cqz));
   memset(ituz,0,sizeof(ituz));
-  sprintf(buf,"select dxcc,cont,cqzone,ituzone from cty");
-  mysql_query(con,buf);
-  res=mysql_use_result(con);
+  db=NULL;
+  if(sqlite3_open_v2(RADIO_CTY_DB,&db,SQLITE_OPEN_READONLY,NULL)!=SQLITE_OK){if(db!=NULL)sqlite3_close(db); home_dxcc=-1; contype=-1; return;}
+  stmt=NULL;
+  if(sqlite3_prepare_v2(db,"select dxcc,cont,cqzone,ituzone from cty",-1,&stmt,NULL)!=SQLITE_OK){sqlite3_close(db); home_dxcc=-1; contype=-1; return;}
+  ok=1;
   for(;;){
-    row=mysql_fetch_row(res);
-    if(row==NULL)break;
-    c=atoi(row[0]);
-    if(c<0 || c>=1000 || row[1]==NULL || row[2]==NULL || row[3]==NULL)continue;
-    strncpy(cont[c],row[1],2);
-    cqz[c]=atoi(row[2]);
-    ituz[c]=atoi(row[3]);
+    rc=sqlite3_step(stmt);
+    if(rc==SQLITE_DONE)break;
+    if(rc!=SQLITE_ROW){ok=0; break;}
+    c=sqlite3_column_int(stmt,0);
+    text=sqlite3_column_text(stmt,1);
+    if(c<0 || c>=1000 || text==NULL)continue;
+    cont[c][0]=(char)text[0];
+    cont[c][1]=(char)text[1];
+    cqz[c]=sqlite3_column_int(stmt,2);
+    ituz[c]=sqlite3_column_int(stmt,3);
   }
-  mysql_free_result(res);
+  sqlite3_finalize(stmt);
+  sqlite3_close(db);
+  if(!ok){home_dxcc=-1; contype=-1;}
 }
 
-void conscore(MYSQL *con,char tok[][100],char *mycall,long long start,long long end){
+void conscore(QsozDb *con,char tok[][100],char *mycall,long long start,long long end){
   int c,vv,d,e,n,z,score,uba_new;
   long uba_total,uba_belgian,uba_belgian_points,uba_bonus;
   char buf[1000],aux1[300],aux2[300],aux3[300],aux4[300],aux5[300],esc_contest[256],esc_mycall[64],*p;
   const char *area,*section,*prefix;
-  MYSQL_RES *res;
-  MYSQL_ROW row;
+  QsozResult *res;
+  QsozRow row;
   double lat1,lat2,lon1,lon2;
   time_t epoch;
   struct tm *t;
@@ -128,10 +135,10 @@ void conscore(MYSQL *con,char tok[][100],char *mycall,long long start,long long 
   uba_bonus=0;
   if(!qsoz_db_escape(con,esc_contest,sizeof(esc_contest),tok[9]) || !qsoz_db_escape(con,esc_mycall,sizeof(esc_mycall),mycall))return;
   sprintf(buf,"select callsign,freqtx,dxcc,contesttx,contestrx,mode,open from log where contest='%s' and mycall='%s' and open>=%lld and open<=%lld order by open desc",esc_contest,esc_mycall,start,end);
-  mysql_query(con,buf);
-  res=mysql_use_result(con);
+  qsoz_db_query(con,buf);
+  res=qsoz_db_result(con);
   for(;;){
-    row=mysql_fetch_row(res);
+    row=qsoz_db_fetch(res);
     if(row==NULL)break;
     c=qsoz_band((int)(atol(row[1])/1000000.0))/10;
     vv=atoi(row[2]);
@@ -1156,5 +1163,5 @@ void conscore(MYSQL *con,char tok[][100],char *mycall,long long start,long long 
     uba_bonus=(uba_belgian_points*uba_belgian)/uba_total;
     if(uba_bonus>0)incdata3(0,1,"UBA:BONUS",uba_bonus,0);
   }
-  mysql_free_result(res);
+  qsoz_db_result_free(res);
 }

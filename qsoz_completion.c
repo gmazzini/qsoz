@@ -1,17 +1,23 @@
-// Gianluca Mazzini @2022- Version 4.1
+// Gianluca Mazzini @2022- Version 4.12
+#include <errno.h>
+#include <fcntl.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/file.h>
 #include <time.h>
-#include <mysql/mysql.h>
-#include "qsoz_config.h"
+#include <unistd.h>
+#include "qsoz_db.h"
+#include <sqlite3.h>
+#include "qsoz_completion.h"
 #include "qsoz_util.h"
+#include "qsoz_user.h"
 
 #define CALL_SIZE 7
 #define INITIAL_CAPACITY 1024UL
 #define LOAD_NUM 7UL
 #define LOAD_DEN 10UL
-#define SQL_BUFFER (1024UL*1024UL)
+#define QSOZ_GRAPH_DB "/home/tools/mcp/work/qrzweb/graph.db"
 
 typedef struct {
   char call[CALL_SIZE];
@@ -25,7 +31,7 @@ typedef struct {
 
 typedef struct {
   unsigned long log_rows;
-  unsigned long wc_rows;
+  unsigned long graph_rows;
   unsigned long valid_rows;
   unsigned long calls;
   unsigned long bigrams;
@@ -37,15 +43,15 @@ static void set_error(char *err,unsigned long cap,const char *text) {
 
   if(err==NULL || cap==0)return;
   n=(unsigned long)strlen(text);
-  if(n>=cap)n=cap-1;
+  if(n>=cap)n=cap-1UL;
   memcpy(err,text,(size_t)n);
   err[n]='\0';
 }
 
-static void set_mysql_error(MYSQL *con,char *err,unsigned long cap,const char *prefix) {
+static void set_sqlite_error(sqlite3 *db,char *err,unsigned long cap,const char *prefix) {
   char tmp[512];
 
-  snprintf(tmp,sizeof(tmp),"%s: %s",prefix,mysql_error(con));
+  snprintf(tmp,sizeof(tmp),"%s: %s",prefix,db==NULL?"unknown SQLite error":sqlite3_errmsg(db));
   set_error(err,cap,tmp);
 }
 
@@ -123,76 +129,57 @@ static int normalize_call(const char *src,char out[CALL_SIZE]) {
   return n>0;
 }
 
-static int load_calls(MYSQL *con,CompletionSet *set,const char *table,unsigned long *scanned,
+static int load_calls(sqlite3 *db,CompletionSet *set,const char *table,unsigned long *scanned,
                       unsigned long *valid,char *err,unsigned long errcap) {
-  MYSQL_RES *res;
-  MYSQL_ROW row;
+  sqlite3_stmt *stmt;
+  const unsigned char *text;
   char query[256],call[CALL_SIZE];
+  int rc;
 
   snprintf(query,sizeof(query),"select callsign from %s where callsign is not null and callsign<>''",table);
-  if(mysql_query(con,query)!=0) {
-    set_mysql_error(con,err,errcap,"completion source query failed");
-    return 0;
-  }
-  res=mysql_use_result(con);
-  if(res==NULL) {
-    set_mysql_error(con,err,errcap,"completion source result failed");
+  stmt=NULL;
+  rc=sqlite3_prepare_v2(db,query,-1,&stmt,NULL);
+  if(rc!=SQLITE_OK) {
+    set_sqlite_error(db,err,errcap,"completion source query failed");
     return 0;
   }
   for(;;) {
-    row=mysql_fetch_row(res);
-    if(row==NULL)break;
+    rc=sqlite3_step(stmt);
+    if(rc==SQLITE_DONE)break;
+    if(rc!=SQLITE_ROW) {
+      set_sqlite_error(db,err,errcap,"completion source read failed");
+      sqlite3_finalize(stmt);
+      return 0;
+    }
+    text=sqlite3_column_text(stmt,0);
     (*scanned)++;
-    if(!normalize_call(row[0],call))continue;
+    if(text==NULL || !normalize_call((const char *)text,call))continue;
     (*valid)++;
     if(!set_add(set,call)) {
-      mysql_free_result(res);
+      sqlite3_finalize(stmt);
       set_error(err,errcap,"completion callsign hash allocation failed");
       return 0;
     }
   }
-  if(mysql_errno(con)!=0) {
-    mysql_free_result(res);
-    set_mysql_error(con,err,errcap,"completion source read failed");
-    return 0;
-  }
-  mysql_free_result(res);
+  sqlite3_finalize(stmt);
   return 1;
 }
 
-static int query_simple(MYSQL *con,const char *query,char *err,unsigned long errcap,const char *what) {
-  if(mysql_query(con,query)==0)return 1;
-  set_mysql_error(con,err,errcap,what);
-  return 0;
-}
+static int lock_rebuild(char *err,unsigned long errcap) {
+  int fd;
 
-static int acquire_lock(MYSQL *con,char *err,unsigned long errcap) {
-  MYSQL_RES *res;
-  MYSQL_ROW row;
-  int ok;
-
-  if(mysql_query(con,"select get_lock('qsoz_completion_rebuild',0)")!=0) {
-    set_mysql_error(con,err,errcap,"completion lock failed");
-    return 0;
+  fd=open(QSOZ_COMPLETION_LOCK,O_CREAT|O_RDWR,0644);
+  if(fd<0) {
+    set_error(err,errcap,"cannot open completion rebuild lock");
+    return -1;
   }
-  res=mysql_store_result(con);
-  if(res==NULL) {
-    set_mysql_error(con,err,errcap,"completion lock result failed");
-    return 0;
+  if(flock(fd,LOCK_EX|LOCK_NB)!=0) {
+    if(errno==EWOULDBLOCK)set_error(err,errcap,"completion rebuild is already running");
+    else set_error(err,errcap,"cannot lock completion rebuild");
+    close(fd);
+    return -1;
   }
-  row=mysql_fetch_row(res);
-  ok=row!=NULL && row[0]!=NULL && atoi(row[0])==1;
-  mysql_free_result(res);
-  if(!ok)set_error(err,errcap,"completion rebuild is already running");
-  return ok;
-}
-
-static void release_lock(MYSQL *con) {
-  MYSQL_RES *res;
-
-  if(mysql_query(con,"select release_lock('qsoz_completion_rebuild')")!=0)return;
-  res=mysql_store_result(con);
-  if(res!=NULL)mysql_free_result(res);
+  return fd;
 }
 
 static int gram_seen(char seen[][4],int count,const char *gram) {
@@ -202,31 +189,20 @@ static int gram_seen(char seen[][4],int count,const char *gram) {
   return 0;
 }
 
-static int flush_insert(MYSQL *con,char *sql,unsigned long len,unsigned long prefix_len,
-                        char *err,unsigned long errcap) {
-  if(len==prefix_len)return 1;
-  if(mysql_query(con,sql)==0)return 1;
-  set_mysql_error(con,err,errcap,"completion batch insert failed");
-  return 0;
-}
-
-static int insert_grams(MYSQL *con,const CompletionSet *set,const char *table,int gram_len,
+static int insert_grams(sqlite3 *db,const CompletionSet *set,const char *table,int gram_len,
                         unsigned long *rows,char *err,unsigned long errcap) {
-  char *sql;
-  char prefix[128],entry[64],gram[4],seen[5][4];
-  unsigned long i,n,len,prefix_len,entry_len;
-  int pos,seen_count,first;
+  sqlite3_stmt *stmt;
+  char sql[128],gram[4],seen[5][4];
+  unsigned long i,n;
+  int pos,seen_count,rc;
 
-  snprintf(prefix,sizeof(prefix),"insert into %s (callsign,gram) values ",table);
-  prefix_len=(unsigned long)strlen(prefix);
-  sql=(char *)malloc((size_t)SQL_BUFFER);
-  if(sql==NULL) {
-    set_error(err,errcap,"completion SQL buffer allocation failed");
+  snprintf(sql,sizeof(sql),"insert into %s(callsign,gram) values(?,?)",table);
+  stmt=NULL;
+  rc=sqlite3_prepare_v2(db,sql,-1,&stmt,NULL);
+  if(rc!=SQLITE_OK) {
+    set_sqlite_error(db,err,errcap,"cannot prepare completion insert");
     return 0;
   }
-  memcpy(sql,prefix,(size_t)prefix_len+1U);
-  len=prefix_len;
-  first=1;
   *rows=0;
   for(i=0;i<set->cap;i++) {
     if(set->slot[i].call[0]=='\0')continue;
@@ -239,114 +215,174 @@ static int insert_grams(MYSQL *con,const CompletionSet *set,const char *table,in
       if(gram_seen(seen,seen_count,gram))continue;
       memcpy(seen[seen_count],gram,(size_t)gram_len+1U);
       seen_count++;
-      snprintf(entry,sizeof(entry),"%s('%s','%s')",first?"":",",set->slot[i].call,gram);
-      entry_len=(unsigned long)strlen(entry);
-      if(len+entry_len+1UL>=SQL_BUFFER) {
-        if(!flush_insert(con,sql,len,prefix_len,err,errcap)) {
-          free(sql);
-          return 0;
-        }
-        memcpy(sql,prefix,(size_t)prefix_len+1U);
-        len=prefix_len;
-        first=1;
-        snprintf(entry,sizeof(entry),"('%s','%s')",set->slot[i].call,gram);
-        entry_len=(unsigned long)strlen(entry);
+      sqlite3_bind_text(stmt,1,set->slot[i].call,-1,SQLITE_STATIC);
+      sqlite3_bind_text(stmt,2,gram,-1,SQLITE_TRANSIENT);
+      rc=sqlite3_step(stmt);
+      if(rc!=SQLITE_DONE) {
+        set_sqlite_error(db,err,errcap,"completion insert failed");
+        sqlite3_finalize(stmt);
+        return 0;
       }
-      memcpy(sql+len,entry,(size_t)entry_len+1U);
-      len+=entry_len;
-      first=0;
+      sqlite3_reset(stmt);
+      sqlite3_clear_bindings(stmt);
       (*rows)++;
     }
   }
-  if(!flush_insert(con,sql,len,prefix_len,err,errcap)) {
-    free(sql);
-    return 0;
-  }
-  free(sql);
+  sqlite3_finalize(stmt);
   return 1;
 }
 
-static int table_count(MYSQL *con,const char *table,unsigned long *count,char *err,unsigned long errcap) {
-  MYSQL_RES *res;
-  MYSQL_ROW row;
-  char query[128];
+static int sqlite_exec(sqlite3 *db,const char *sql,char *err,unsigned long errcap,const char *what) {
+  char *msg;
+  int rc;
 
-  snprintf(query,sizeof(query),"select count(*) from %s",table);
-  if(mysql_query(con,query)!=0) {
-    set_mysql_error(con,err,errcap,"completion validation query failed");
+  msg=NULL;
+  rc=sqlite3_exec(db,sql,NULL,NULL,&msg);
+  if(rc==SQLITE_OK)return 1;
+  if(msg!=NULL) {
+    char tmp[512];
+
+    snprintf(tmp,sizeof(tmp),"%s: %s",what,msg);
+    set_error(err,errcap,tmp);
+    sqlite3_free(msg);
+  } else set_sqlite_error(db,err,errcap,what);
+  return 0;
+}
+
+static int sqlite_quick_check(sqlite3 *db,char *err,unsigned long errcap) {
+  sqlite3_stmt *stmt;
+  const unsigned char *text;
+  int rc,ok;
+
+  stmt=NULL;
+  rc=sqlite3_prepare_v2(db,"pragma quick_check",-1,&stmt,NULL);
+  if(rc!=SQLITE_OK) {
+    set_sqlite_error(db,err,errcap,"completion integrity check prepare failed");
     return 0;
   }
-  res=mysql_store_result(con);
-  if(res==NULL) {
-    set_mysql_error(con,err,errcap,"completion validation result failed");
+  rc=sqlite3_step(stmt);
+  text=rc==SQLITE_ROW?sqlite3_column_text(stmt,0):NULL;
+  ok=text!=NULL && strcmp((const char *)text,"ok")==0;
+  if(!ok)set_sqlite_error(db,err,errcap,"completion integrity check failed");
+  sqlite3_finalize(stmt);
+  return ok;
+}
+
+static int sqlite_count(sqlite3 *db,const char *table,unsigned long *count,char *err,unsigned long errcap) {
+  sqlite3_stmt *stmt;
+  char sql[128];
+  int rc;
+
+  snprintf(sql,sizeof(sql),"select count(*) from %s",table);
+  stmt=NULL;
+  rc=sqlite3_prepare_v2(db,sql,-1,&stmt,NULL);
+  if(rc!=SQLITE_OK) {
+    set_sqlite_error(db,err,errcap,"completion validation prepare failed");
     return 0;
   }
-  row=mysql_fetch_row(res);
-  if(row==NULL || row[0]==NULL) {
-    mysql_free_result(res);
-    set_error(err,errcap,"completion validation returned no count");
+  rc=sqlite3_step(stmt);
+  if(rc!=SQLITE_ROW) {
+    set_sqlite_error(db,err,errcap,"completion validation failed");
+    sqlite3_finalize(stmt);
     return 0;
   }
-  *count=strtoul(row[0],NULL,10);
-  mysql_free_result(res);
+  *count=(unsigned long)sqlite3_column_int64(stmt,0);
+  sqlite3_finalize(stmt);
   return 1;
 }
 
-static void cleanup_staging(MYSQL *con) {
-  mysql_query(con,"drop table if exists aux2_new,aux3_new");
-}
-
-static int completion_rebuild(MYSQL *con,CompletionStats *stats,char *err,unsigned long errcap) {
-  CompletionSet set;
+static int build_sqlite(const CompletionSet *set,CompletionStats *stats,char *err,unsigned long errcap) {
+  sqlite3 *db;
+  char path[512];
   unsigned long check2,check3;
-  int locked,swapped,ok;
+  int rc,ok;
+
+  db=NULL;
+  ok=0;
+  snprintf(path,sizeof(path),"%s.new.%ld",QSOZ_COMPLETION_DB,(long)getpid());
+  unlink(path);
+  rc=sqlite3_open_v2(path,&db,SQLITE_OPEN_READWRITE|SQLITE_OPEN_CREATE,NULL);
+  if(rc!=SQLITE_OK) {
+    set_sqlite_error(db,err,errcap,"cannot create completion database");
+    if(db!=NULL)sqlite3_close(db);
+    unlink(path);
+    return 0;
+  }
+  if(!sqlite_exec(db,"pragma journal_mode=off; pragma synchronous=full; pragma temp_store=memory;",err,errcap,"cannot configure completion database"))goto end;
+  if(!sqlite_exec(db,"create table bigram(callsign text not null,gram text not null,primary key(callsign,gram)) without rowid; create table trigram(callsign text not null,gram text not null,primary key(callsign,gram)) without rowid;",err,errcap,"cannot create completion tables"))goto end;
+  if(!sqlite_exec(db,"begin immediate",err,errcap,"cannot start completion build"))goto end;
+  if(!insert_grams(db,set,"bigram",2,&stats->bigrams,err,errcap))goto rollback;
+  if(!insert_grams(db,set,"trigram",3,&stats->trigrams,err,errcap))goto rollback;
+  if(!sqlite_exec(db,"commit",err,errcap,"cannot commit completion data"))goto end;
+  if(!sqlite_exec(db,"create index bigram_gram on bigram(gram,callsign); create index trigram_gram on trigram(gram,callsign);",err,errcap,"cannot index completion database"))goto end;
+  check2=0;
+  check3=0;
+  if(!sqlite_count(db,"bigram",&check2,err,errcap) || !sqlite_count(db,"trigram",&check3,err,errcap))goto end;
+  if(check2!=stats->bigrams || check3!=stats->trigrams) {
+    set_error(err,errcap,"completion database row count mismatch");
+    goto end;
+  }
+  if(!sqlite_exec(db,"pragma optimize",err,errcap,"cannot optimize completion database"))goto end;
+  if(!sqlite_quick_check(db,err,errcap))goto end;
+  if(sqlite3_close(db)!=SQLITE_OK) {
+    db=NULL;
+    set_error(err,errcap,"cannot close completion database");
+    goto cleanup;
+  }
+  db=NULL;
+  if(rename(path,QSOZ_COMPLETION_DB)!=0) {
+    set_error(err,errcap,"cannot install completion database");
+    goto cleanup;
+  }
+  ok=1;
+  goto cleanup;
+
+rollback:
+  sqlite3_exec(db,"rollback",NULL,NULL,NULL);
+end:
+  if(db!=NULL)sqlite3_close(db);
+cleanup:
+  if(!ok)unlink(path);
+  return ok;
+}
+
+static int completion_rebuild(CompletionStats *stats,char *err,unsigned long errcap) {
+  CompletionSet set;
+  sqlite3 *logdb,*graphdb;
+  int lockfd,ok,rc;
 
   memset(&set,0,sizeof(set));
   memset(stats,0,sizeof(*stats));
   err[0]='\0';
-  locked=0;
-  swapped=0;
   ok=0;
-  if(!acquire_lock(con,err,errcap))goto end;
-  locked=1;
-
-  if(!load_calls(con,&set,"log",&stats->log_rows,&stats->valid_rows,err,errcap))goto end;
-  if(!load_calls(con,&set,"wc",&stats->wc_rows,&stats->valid_rows,err,errcap))goto end;
+  logdb=NULL;
+  graphdb=NULL;
+  rc=sqlite3_open_v2(QSOZ_LOG_DB,&logdb,SQLITE_OPEN_READONLY,NULL);
+  if(rc!=SQLITE_OK) {set_sqlite_error(logdb,err,errcap,"cannot open log database"); goto end_db;}
+  rc=sqlite3_open_v2(QSOZ_GRAPH_DB,&graphdb,SQLITE_OPEN_READONLY,NULL);
+  if(rc!=SQLITE_OK) {set_sqlite_error(graphdb,err,errcap,"cannot open graph database"); goto end_db;}
+  sqlite3_busy_timeout(logdb,5000);
+  sqlite3_busy_timeout(graphdb,5000);
+  lockfd=lock_rebuild(err,errcap);
+  if(lockfd<0)goto end_db;
+  ok=0;
+  if(!load_calls(logdb,&set,"log",&stats->log_rows,&stats->valid_rows,err,errcap))goto end;
+  if(!load_calls(graphdb,&set,"contacts",&stats->graph_rows,&stats->valid_rows,err,errcap))goto end;
   if(set.count==0) {
     set_error(err,errcap,"completion source contains no valid callsigns");
     goto end;
   }
   stats->calls=set.count;
-
-  if(!query_simple(con,"drop table if exists aux2_new,aux3_new,aux2_old,aux3_old",err,errcap,"completion staging cleanup failed"))goto end;
-  if(!query_simple(con,"create table aux2_new like aux2",err,errcap,"cannot create aux2_new"))goto end;
-  if(!query_simple(con,"create table aux3_new like aux3",err,errcap,"cannot create aux3_new"))goto end;
-  if(!query_simple(con,"alter table aux2_new drop primary key,drop index gram",err,errcap,"cannot prepare aux2_new"))goto end;
-  if(!query_simple(con,"alter table aux3_new drop primary key,drop index gram",err,errcap,"cannot prepare aux3_new"))goto end;
-
-  if(!insert_grams(con,&set,"aux2_new",2,&stats->bigrams,err,errcap))goto end;
-  if(!insert_grams(con,&set,"aux3_new",3,&stats->trigrams,err,errcap))goto end;
-
-  if(!query_simple(con,"alter table aux2_new add primary key (callsign,gram),add key gram (gram)",err,errcap,"cannot index aux2_new"))goto end;
-  if(!query_simple(con,"alter table aux3_new add primary key (callsign,gram),add key gram (gram)",err,errcap,"cannot index aux3_new"))goto end;
-
-  check2=0;
-  check3=0;
-  if(!table_count(con,"aux2_new",&check2,err,errcap) || !table_count(con,"aux3_new",&check3,err,errcap))goto end;
-  if(check2!=stats->bigrams || check3!=stats->trigrams) {
-    set_error(err,errcap,"completion staging row count mismatch");
-    goto end;
-  }
-
-  if(!query_simple(con,"rename table aux2 to aux2_old,aux2_new to aux2,aux3 to aux3_old,aux3_new to aux3",err,errcap,"completion atomic swap failed"))goto end;
-  swapped=1;
-  if(mysql_query(con,"drop table if exists aux2_old,aux3_old")!=0)fprintf(stderr,"pcompletion: old table cleanup failed: %s\n",mysql_error(con));
+  if(!build_sqlite(&set,stats,err,errcap))goto end;
   ok=1;
 
 end:
-  if(!swapped)cleanup_staging(con);
   free(set.slot);
-  if(locked)release_lock(con);
+  flock(lockfd,LOCK_UN);
+  close(lockfd);
+end_db:
+  if(graphdb!=NULL)sqlite3_close(graphdb);
+  if(logdb!=NULL)sqlite3_close(logdb);
   return ok;
 }
 
@@ -361,64 +397,33 @@ static int read_ota(char *ota,unsigned long cap) {
   return qsoz_token_valid(ota);
 }
 
-static int auth_admin(MYSQL *con,const char *ota) {
-  MYSQL_RES *res;
-  MYSQL_ROW row;
-  char query[256];
-  int ok;
-
-  snprintf(query,sizeof(query),"select mycall from user where ota='%s' and lastota+durationota>%ld limit 1",ota,(long)time(NULL));
-  if(mysql_query(con,query)!=0)return 0;
-  res=mysql_store_result(con);
-  if(res==NULL)return 0;
-  row=mysql_fetch_row(res);
-  ok=row!=NULL && row[0]!=NULL && strcmp(row[0],"IK4LZH")==0;
-  mysql_free_result(res);
-  return ok;
-}
-
 int qsoz_completion_main(void) {
-  QsozConfig cfg;
   CompletionStats stats;
-  MYSQL *con;
   char ota[64],err[512];
 
-  con=NULL;
   err[0]='\0';
   printf("Content-Type: text/html; charset=utf-8\r\n\r\n<!--33-->");
   if(!read_ota(ota,sizeof(ota))) {
     printf("<pre><b>Login expired</b></pre>");
     return 0;
   }
-  if(!qsoz_config_load(&cfg,QSOZ_CONFIG_FILE,err,sizeof(err)))goto fail;
-  con=mysql_init(NULL);
-  if(con==NULL) {
-    set_error(err,sizeof(err),"database initialization failed");
-    goto fail;
-  }
-  if(mysql_real_connect(con,cfg.db_host,cfg.db_user,cfg.db_pass,cfg.db_name,cfg.db_port,NULL,0)==NULL) {
-    set_error(err,sizeof(err),"database connection failed");
-    goto fail;
-  }
-  if(!auth_admin(con,ota)) {
+  if(!qsoz_user_admin(ota)) {
     set_error(err,sizeof(err),"completion rebuild is restricted to IK4LZH");
     goto fail;
   }
-  if(!completion_rebuild(con,&stats,err,sizeof(err)))goto fail;
+  if(!completion_rebuild(&stats,err,sizeof(err)))goto fail;
 
   printf("<pre><b>Completion updated</b>\n");
   printf("log rows scanned: %lu\n",stats.log_rows);
-  printf("wc rows scanned: %lu\n",stats.wc_rows);
+  printf("graph rows scanned: %lu\n",stats.graph_rows);
   printf("valid source rows: %lu\n",stats.valid_rows);
   printf("unique callsigns: %lu\n",stats.calls);
-  printf("aux2 bigrams: %lu\n",stats.bigrams);
-  printf("aux3 trigrams: %lu\n",stats.trigrams);
+  printf("bigrams: %lu\n",stats.bigrams);
+  printf("trigrams: %lu\n",stats.trigrams);
   printf("</pre>");
-  mysql_close(con);
   return 0;
 
 fail:
   printf("<pre><b>Completion update failed</b>\n%s\n</pre>",err[0]?err:"unknown error");
-  if(con!=NULL)mysql_close(con);
   return 0;
 }

@@ -1,11 +1,26 @@
-// Gianluca Mazzini @2022- Version 4.1
+// Gianluca Mazzini @2022- Version 4.12
 #include <stdio.h>
+#include <grp.h>
+#include <pwd.h>
+#include <unistd.h>
 #include <stdlib.h>
 #include <string.h>
 #include "qsoz_app.h"
 #include "qsoz_version.h"
 
 #define OP_SIZE 32
+
+static int drop_to_mcp(void) {
+  struct passwd *pw;
+
+  if(geteuid()!=0)return 1;
+  pw=getpwnam("mcp");
+  if(pw==NULL)return 0;
+  if(initgroups(pw->pw_name,pw->pw_gid)!=0)return 0;
+  if(setgid(pw->pw_gid)!=0)return 0;
+  if(setuid(pw->pw_uid)!=0)return 0;
+  return 1;
+}
 
 static int query_op(char *out,unsigned long cap) {
   const char *query,*p,*end;
@@ -46,6 +61,10 @@ static int not_found(void) {
 int main(void) {
   char op[OP_SIZE];
 
+  if(!drop_to_mcp()){
+    printf("Status: 500 Internal Server Error\r\nContent-Type: text/plain; charset=utf-8\r\n\r\nPrivilege drop failed\n");
+    return 0;
+  }
   if(!query_op(op,sizeof(op))){
     printf("Status: 400 Bad Request\r\nContent-Type: text/plain; charset=utf-8\r\n\r\nBad request\n");
     return 0;
@@ -61,5 +80,6 @@ int main(void) {
   if(strcmp(op,"radio")==0)return qsoz_radio_main();
   if(strcmp(op,"release")==0)return release_main();
   if(strcmp(op,"time")==0)return qsoz_clock_main();
+  if(strcmp(op,"users")==0)return qsoz_users_main();
   return not_found();
 }

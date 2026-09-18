@@ -1,13 +1,15 @@
-// Gianluca Mazzini @2022- Version 4.4
+// Gianluca Mazzini @2022- Version 4.13
 #include <errno.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
 #include <unistd.h>
+#include <sys/stat.h>
 #include <math.h>
-#include <mysql/mysql.h>
-#include "qsoz_config.h"
+#include "qsoz_db.h"
+#include <sqlite3.h>
+#include "/home/tools/mcp/work/data/radio_data.h"
 
 #define DXCC_MAX 1000
 #define BAND_COUNT 11
@@ -21,7 +23,7 @@
 #define MONTH_FIRST 201901
 #define CACHE_FILE "/home/tools/mcp/work/qsoz/tmpdata/ft8.cache"
 #define CACHE_MAGIC "PFT8C01"
-#define CACHE_VERSION 1UL
+#define CACHE_VERSION 3UL
 #define CACHE_MONTH_MAX 10000UL
 
 typedef struct {
@@ -36,10 +38,10 @@ typedef struct {
 } MonthVec;
 
 typedef struct {
-  unsigned long long log_update;
-  unsigned long long cty_update;
-  unsigned long long max_open;
-  unsigned long long log_rows;
+  unsigned long long log_revision;
+  unsigned long long cty_mtime;
+  unsigned long long cty_size;
+  unsigned long long cty_inode;
 } CacheKey;
 
 typedef struct {
@@ -127,38 +129,29 @@ static int cmp_month(const void *a,const void *b) {
 }
 
 static int cache_key_equal(const CacheKey *a,const CacheKey *b) {
-  return a->log_update==b->log_update && a->cty_update==b->cty_update &&
-         a->max_open==b->max_open && a->log_rows==b->log_rows;
+  return a->log_revision==b->log_revision && a->cty_mtime==b->cty_mtime &&
+         a->cty_size==b->cty_size && a->cty_inode==b->cty_inode;
 }
 
-static int get_cache_key(MYSQL *con,const char *dbname,CacheKey *key) {
-  MYSQL_RES *res;
-  MYSQL_ROW row;
-  char escaped[256],query[1024];
-  unsigned long n;
+static int get_cache_key(QsozDb *con,CacheKey *key) {
+  QsozResult *res;
+  QsozRow row;
+  struct stat st;
 
-  if(strlen(dbname)>120)return 0;
-  n=mysql_real_escape_string(con,escaped,dbname,(unsigned long)strlen(dbname));
-  if(n>=sizeof(escaped))return 0;
-  snprintf(query,sizeof(query),
-           "select coalesce(unix_timestamp(max(case when table_name='log' then update_time end)),0),"
-           "coalesce(unix_timestamp(max(case when table_name='cty' then update_time end)),0),"
-           "coalesce((select max(open) from log),0),"
-           "coalesce(max(case when table_name='log' then table_rows end),0) "
-           "from information_schema.tables where table_schema='%s' and table_name in ('log','cty')",escaped);
-  if(mysql_query(con,query)!=0)return 0;
-  res=mysql_store_result(con);
+  if(stat(RADIO_CTY_DB,&st)!=0)return 0;
+  if(qsoz_db_query(con,"select value from log_meta where key='revision'")!=0)return 0;
+  res=qsoz_db_result(con);
   if(res==NULL)return 0;
-  row=mysql_fetch_row(res);
-  if(row==NULL || row[0]==NULL || row[1]==NULL || row[2]==NULL || row[3]==NULL) {
-    mysql_free_result(res);
+  row=qsoz_db_fetch(res);
+  if(row==NULL || row[0]==NULL) {
+    qsoz_db_result_free(res);
     return 0;
   }
-  key->log_update=strtoull(row[0],NULL,10);
-  key->cty_update=strtoull(row[1],NULL,10);
-  key->max_open=strtoull(row[2],NULL,10);
-  key->log_rows=strtoull(row[3],NULL,10);
-  mysql_free_result(res);
+  key->log_revision=strtoull(row[0],NULL,10);
+  key->cty_mtime=(unsigned long long)st.st_mtime;
+  key->cty_size=(unsigned long long)st.st_size;
+  key->cty_inode=(unsigned long long)st.st_ino;
+  qsoz_db_result_free(res);
   return 1;
 }
 
@@ -221,39 +214,43 @@ static void cache_save(const CacheKey *key,const unsigned long acc[BAND_COUNT][D
   } else unlink(path);
 }
 
-static int load_cq(MYSQL *con,int cq[DXCC_MAX]) {
-  MYSQL_RES *res;
-  MYSQL_ROW row;
-  int dx;
+static int load_cq(int cq[DXCC_MAX]) {
+  sqlite3 *db;
+  sqlite3_stmt *stmt;
+  int dx,rc,ok;
 
   memset(cq,0,sizeof(int)*DXCC_MAX);
-  if(mysql_query(con,"select dxcc,cqzone from cty")!=0)return 0;
-  res=mysql_use_result(con);
-  if(res==NULL)return 0;
+  db=NULL;
+  if(sqlite3_open_v2(RADIO_CTY_DB,&db,SQLITE_OPEN_READONLY,NULL)!=SQLITE_OK){if(db!=NULL)sqlite3_close(db); return 0;}
+  stmt=NULL;
+  if(sqlite3_prepare_v2(db,"select dxcc,cqzone from cty",-1,&stmt,NULL)!=SQLITE_OK){sqlite3_close(db); return 0;}
+  ok=1;
   for(;;) {
-    row=mysql_fetch_row(res);
-    if(row==NULL)break;
-    dx=atoi(row[0]);
-    if(dx>=0 && dx<DXCC_MAX)cq[dx]=atoi(row[1]);
+    rc=sqlite3_step(stmt);
+    if(rc==SQLITE_DONE)break;
+    if(rc!=SQLITE_ROW){ok=0; break;}
+    dx=sqlite3_column_int(stmt,0);
+    if(dx>=0 && dx<DXCC_MAX)cq[dx]=sqlite3_column_int(stmt,1);
   }
-  mysql_free_result(res);
-  return mysql_errno(con)==0;
+  sqlite3_finalize(stmt);
+  sqlite3_close(db);
+  return ok;
 }
 
-static int load_qso(MYSQL *con,const int cq[DXCC_MAX],unsigned long acc[BAND_COUNT][DELTA_COUNT],
+static int load_qso(QsozDb *con,const int cq[DXCC_MAX],unsigned long acc[BAND_COUNT][DELTA_COUNT],
                     unsigned long total[BAND_COUNT],MonthVec *mv,unsigned long *processed) {
-  MYSQL_RES *res;
-  MYSQL_ROW row;
+  QsozResult *res;
+  QsozRow row;
   MonthData *md;
   long mhz,key;
   int bi,tx,rx,delta,dx,zone;
   time_t epoch;
 
-  if(mysql_query(con,"select freqtx,signaltx,signalrx,dxcc,open from log where mode='FT8' or mode='MFSK'")!=0)return 0;
-  res=mysql_use_result(con);
+  if(qsoz_db_query(con,"select freqtx,signaltx,signalrx,dxcc,open from log where mode='FT8' or mode='MFSK'")!=0)return 0;
+  res=qsoz_db_result(con);
   if(res==NULL)return 0;
   for(;;) {
-    row=mysql_fetch_row(res);
+    row=qsoz_db_fetch(res);
     if(row==NULL)break;
     mhz=atol(row[0])/1000000L;
     if(mhz==0 || mhz>29)continue;
@@ -272,13 +269,13 @@ static int load_qso(MYSQL *con,const int cq[DXCC_MAX],unsigned long acc[BAND_COU
     key=month_key(epoch);
     zone=(dx>=0 && dx<DXCC_MAX)?cq[dx]:0;
     if(key>=MONTH_FIRST && zone>=CQ_MIN && zone<=CQ_MAX) {
-      if(!month_get(mv,key,&md)) {mysql_free_result(res); return 0;}
+      if(!month_get(mv,key,&md)) {qsoz_db_result_free(res); return 0;}
       md->cq[zone]++;
     }
     (*processed)++;
   }
-  mysql_free_result(res);
-  return mysql_errno(con)==0;
+  qsoz_db_result_free(res);
+  return qsoz_db_errno(con)==0;
 }
 
 static void print_css(void) {
@@ -385,48 +382,37 @@ static void print_cq_chart(const MonthVec *mv) {
 }
 
 int qsoz_ft8_main(void) {
-  QsozConfig cfg;
-  MYSQL *con;
+  QsozDb *con;
   MonthVec mv;
   CacheKey key_before,key_after;
   unsigned long acc[BAND_COUNT][DELTA_COUNT],total[BAND_COUNT],processed;
   int cq[DXCC_MAX],cached,have_key;
-  char err[256];
 
   memset(&mv,0,sizeof(mv));
   memset(acc,0,sizeof(acc));
   memset(total,0,sizeof(total));
   processed=0;
   printf("Content-Type: text/html; charset=utf-8\r\n\r\n");
-  if(!qsoz_config_load(&cfg,QSOZ_CONFIG_FILE,err,sizeof(err))) {
-    printf("<html><body><pre>Configuration error</pre></body></html>");
-    return 0;
-  }
-  con=mysql_init(NULL);
+  con=qsoz_db_open();
   if(con==NULL) {
     printf("<html><body><pre>Database initialization error</pre></body></html>");
     return 0;
   }
-  if(mysql_real_connect(con,cfg.db_host,cfg.db_user,cfg.db_pass,cfg.db_name,cfg.db_port,NULL,0)==NULL) {
-    printf("<html><body><pre>Database connection error</pre></body></html>");
-    mysql_close(con);
-    return 0;
-  }
   cached=0;
-  have_key=get_cache_key(con,cfg.db_name,&key_before);
+  have_key=get_cache_key(con,&key_before);
   if(have_key)cached=cache_load(&key_before,acc,total,&mv,&processed);
   if(!cached) {
-    if(!load_cq(con,cq) || !load_qso(con,cq,acc,total,&mv,&processed)) {
+    if(!load_cq(cq) || !load_qso(con,cq,acc,total,&mv,&processed)) {
       printf("<html><body><pre>Database query error</pre></body></html>");
       free(mv.v);
-      mysql_close(con);
+      qsoz_db_close(con);
       return 0;
     }
     qsort(mv.v,(size_t)mv.count,sizeof(MonthData),cmp_month);
-    if(have_key && get_cache_key(con,cfg.db_name,&key_after) && cache_key_equal(&key_before,&key_after))
+    if(have_key && get_cache_key(con,&key_after) && cache_key_equal(&key_before,&key_after))
       cache_save(&key_after,acc,total,&mv,processed);
   }
-  mysql_close(con);
+  qsoz_db_close(con);
 
   printf("<!doctype html><html><head><meta charset='utf-8'><meta name='viewport' content='width=device-width,initial-scale=1'><title>FT8 symmetricity</title>");
   print_css();

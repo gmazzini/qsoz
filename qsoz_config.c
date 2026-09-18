@@ -1,4 +1,4 @@
-// Gianluca Mazzini @2022- Version 3.0
+// Gianluca Mazzini @2022- Version 4.12
 #include <ctype.h>
 #include <errno.h>
 #include <stdio.h>
@@ -64,8 +64,6 @@ int qsoz_config_load(QsozConfig *cfg,const char *path,char *err,unsigned long er
   }
 
   memset(cfg,0,sizeof(*cfg));
-  copy_value(cfg->db_host,sizeof(cfg->db_host),"127.0.0.1");
-  cfg->db_port=3306;
   copy_value(cfg->callbook_host,sizeof(cfg->callbook_host),"127.0.0.1");
   cfg->callbook_port=22223;
   cfg->callbook_timeout=5;
@@ -94,17 +92,7 @@ int qsoz_config_load(QsozConfig *cfg,const char *path,char *err,unsigned long er
     value=trim(eq+1);
     key=trim(key);
 
-    if (strcmp(key,"db_host")==0) {
-      if (!copy_value(cfg->db_host,sizeof(cfg->db_host),value)) goto value_error;
-    } else if (strcmp(key,"db_user")==0) {
-      if (!copy_value(cfg->db_user,sizeof(cfg->db_user),value)) goto value_error;
-    } else if (strcmp(key,"db_pass")==0) {
-      if (!copy_value(cfg->db_pass,sizeof(cfg->db_pass),value)) goto value_error;
-    } else if (strcmp(key,"db_name")==0) {
-      if (!copy_value(cfg->db_name,sizeof(cfg->db_name),value)) goto value_error;
-    } else if (strcmp(key,"db_port")==0) {
-      if (!parse_uint(value,1,65535,&cfg->db_port)) goto value_error;
-    } else if (strcmp(key,"callbook_host")==0) {
+    if (strcmp(key,"callbook_host")==0) {
       if (!copy_value(cfg->callbook_host,sizeof(cfg->callbook_host),value)) goto value_error;
     } else if (strcmp(key,"callbook_port")==0) {
       if (!parse_uint(value,1,65535,&cfg->callbook_port)) goto value_error;
@@ -130,9 +118,5 @@ value_error:
   }
   fclose(fp);
 
-  if (cfg->db_user[0]=='\0' || cfg->db_name[0]=='\0') {
-    set_error(err,errcap,"missing database configuration",0);
-    return 0;
-  }
   return 1;
 }
